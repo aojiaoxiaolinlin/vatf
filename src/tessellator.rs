@@ -255,7 +255,7 @@ pub struct Draw {
     pub draw_type: DrawType,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
-    #[expect(unused)]
+    #[expect(dead_code)] // Reserved for the stencil-only mesh path.
     pub mask_index_count: u32,
 }
 
@@ -278,18 +278,18 @@ pub struct Gradient {
 }
 
 impl Gradient {
-    pub fn compute_gradient_color(&self, gradienet_size: usize) -> Vec<u8> {
+    pub fn compute_gradient_color(&self, gradient_size: usize) -> Vec<u8> {
         if self.records.is_empty() {
-            vec![0; gradienet_size * 4]
+            vec![0; gradient_size * 4]
         } else {
-            let mut colors = vec![0; gradienet_size * 4];
+            let mut colors = vec![0; gradient_size * 4];
             let convert = if self.interpolation == swf::GradientInterpolation::LinearRgb {
                 |color| color
             } else {
                 |color| color
             };
 
-            for t in 0..gradienet_size {
+            for t in 0..gradient_size {
                 let mut last = 0;
                 let mut next = 0;
                 for (i, record) in self.records.iter().enumerate().rev() {
@@ -352,9 +352,7 @@ pub struct Bitmap {
     pub matrix: [[f32; 3]; 3],
     pub bitmap_id: u16,
     /// 设置Sampler 为Repeat 或者 Clamp
-    #[expect(unused)]
     pub is_smoothed: bool,
-    #[expect(unused)]
     pub is_repeating: bool,
 }
 

@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+bincode = "1"
 bytemuck = {version = "1.25.0", features = ["derive"]}
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 flate2 = "1.1.9"
 gif = "0.14.2"
 git = "0.3.0"
@@ -17,5 +20,12 @@ png = "0.18.1"
 swf = "0.2.2"
 thiserror = "2.0.18"
 tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
 wide = "1.4.0"
-zstd = "0.13.3"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench_read"
+harness = false
