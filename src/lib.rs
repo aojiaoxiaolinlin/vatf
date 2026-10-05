@@ -1,10 +1,17 @@
 pub mod animation;
 pub mod baked;
 mod bitmap;
+mod compiler;
+pub use compiler::{
+    COMPILER_REVISION, CompiledVab, SwfCompileMode, SwfCompileSettings, compile_swf, convert_swf,
+};
 mod decoder;
 pub mod filter;
+pub mod graphics;
 mod matrix;
 mod morph;
+mod pruning;
+pub use pruning::{ResourceCounts, ResourcePruningReport};
 pub mod reader;
 mod shape_utils;
 mod tessellator;
@@ -17,7 +24,6 @@ use std::{
     io::{BufReader, Cursor},
     mem,
     path::{Path, PathBuf},
-    time::Instant,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -283,6 +289,8 @@ impl DisplayObject {
 
 #[derive(Default)]
 pub struct VatfBuilder {
+    pub graphics: Option<Vec<graphics::Graphic>>,
+    pub buttons: Vec<graphics::Button>,
     pub shape_records: Vec<ShapeRecord>,
     pub shape_meshes: Vec<ShapeMesh>,
     pub gradient_uniforms: Vec<GradientUniforms>,
@@ -328,15 +336,22 @@ impl VatfBuilder {
         shape: &Shape,
         bitmap: &HashMap<CharacterId, CompressedBitmap>,
     ) -> (u32, u32) {
-        // Quantise against `edge_bounds` (which includes stroke widths) rather
-        // than `shape_bounds` (fill outline only) — otherwise vertices produced
-        // by stroke expansion get clamped to ±32767 and thick strokes flatten.
-        let bounds = (
-            shape.edge_bounds.x_min.to_pixels() as f32,
-            shape.edge_bounds.y_min.to_pixels() as f32,
-            shape.edge_bounds.x_max.to_pixels() as f32,
-            shape.edge_bounds.y_max.to_pixels() as f32,
+        let mut tessellator = ShapeTessellator::default();
+        let lyon_mesh = tessellator.tessellate_shape(shape.into(), bitmap);
+        // EdgeBounds excludes stroke expansion. Include actual tessellated vertices,
+        // including caps and miter joins, so i16 quantization cannot flatten them.
+        let mut bounds = (
+            shape.shape_bounds.x_min.to_pixels() as f32,
+            shape.shape_bounds.y_min.to_pixels() as f32,
+            shape.shape_bounds.x_max.to_pixels() as f32,
+            shape.shape_bounds.y_max.to_pixels() as f32,
         );
+        for vertex in lyon_mesh.draws.iter().flat_map(|draw| &draw.vertices) {
+            bounds.0 = bounds.0.min(vertex.x);
+            bounds.1 = bounds.1.min(vertex.y);
+            bounds.2 = bounds.2.max(vertex.x);
+            bounds.3 = bounds.3.max(vertex.y);
+        }
         let bounds_min = (bounds.0, bounds.1);
         let bounds_max = (bounds.2, bounds.3);
 
@@ -345,9 +360,6 @@ impl VatfBuilder {
         let b_half_y = (bounds_max.1 - bounds_min.1) * 0.5;
         let b_center_x = (bounds_max.0 + bounds_min.0) * 0.5;
         let b_center_y = (bounds_max.1 + bounds_min.1) * 0.5;
-
-        let mut tessellator = ShapeTessellator::default();
-        let lyon_mesh = tessellator.tessellate_shape(shape.into(), bitmap);
 
         // Pre-encode gradient textures (WebP compressed).
         let gradients: Vec<_> = lyon_mesh
@@ -496,35 +508,60 @@ impl VatfBuilder {
 
     /// Serialise all collected data into a compressed .vab file.
     pub fn write_vatf(&mut self, path: PathBuf) -> Result<()> {
+        self.write_vatf_with_report(path).map(|_| ())
+    }
+
+    /// Write compact runtime resources without mutating compiler-side source data.
+    pub fn write_vatf_with_report(&mut self, path: PathBuf) -> Result<ResourcePruningReport> {
+        let (bytes, report) = self.to_vab_bytes()?;
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        Ok(report)
+    }
+
+    /// Serialize compact resources without altering source timelines or offsets.
+    pub fn to_vab_bytes(&self) -> Result<(Vec<u8>, ResourcePruningReport)> {
         if cfg!(target_endian = "big") {
             bail!("VATF POD chunks require a little-endian host");
         }
-        use std::io::Write;
 
         // -----------------------------------------------------------------------
         // 1. Define chunks (FourCC + raw byte slice)
         // -----------------------------------------------------------------------
         type ChunkSpec<'a> = (&'a [u8; 4], &'a [u8]);
 
-        let shape_records = bytemuck::cast_slice(&self.shape_records);
-        let shape_meshes = bytemuck::cast_slice(&self.shape_meshes);
-        let gradient_uniforms = bytemuck::cast_slice(&self.gradient_uniforms);
-        let bitmap_uniforms = bytemuck::cast_slice(&self.bitmap_uniforms);
-        let texture: &[u8] = &self.texture;
-        let vertices = bytemuck::cast_slice(&self.vertices);
-        let indices = bytemuck::cast_slice(&self.indices);
-        let morph_bytes: &[u8] = bytemuck::cast_slice(&self.morph_entries);
-
         let container = animation::AnimContainer::from_parts(
             &self.animations,
             &self.frame_labels,
             self.frame_rate,
         );
-        let baked =
-            baked::bake_with_skin_variants(&container, &self.event_labels, &self.skin_variants)?;
+        let baked = if self.graphics.is_some() {
+            baked::BakedMovie::default()
+        } else {
+            baked::bake_with_skin_variants(&container, &self.event_labels, &self.skin_variants)?
+        };
         baked.validate()?;
+        let (resources, report) = pruning::Resources::compact(
+            self,
+            &baked,
+            self.graphics.as_deref().unwrap_or_default(),
+        )?;
+        let shape_records = bytemuck::cast_slice(&resources.shapes);
+        let shape_meshes = bytemuck::cast_slice(&resources.meshes);
+        let gradient_uniforms = bytemuck::cast_slice(&resources.gradients);
+        let bitmap_uniforms = bytemuck::cast_slice(&resources.bitmaps);
+        let texture: &[u8] = &resources.texture;
+        let vertices = bytemuck::cast_slice(&resources.vertices);
+        let indices = bytemuck::cast_slice(&resources.indices);
+        let morph_bytes: &[u8] = bytemuck::cast_slice(&resources.morphs);
         let baked_bytes = bincode::serialize(&baked)?;
-        let chunks: [ChunkSpec; 9] = [
+        let graphic_bytes = self.graphics.as_ref().map(bincode::serialize).transpose()?;
+        let button_bytes = if self.buttons.is_empty() {
+            None
+        } else {
+            Some(bincode::serialize(&self.buttons)?)
+        };
+        let mut chunks: Vec<ChunkSpec> = vec![
             (b"BAKD", &baked_bytes),
             (b"SHAP", shape_records),
             (b"SHME", shape_meshes),
@@ -539,6 +576,12 @@ impl VatfBuilder {
         // -----------------------------------------------------------------------
         // 2. Compute sizes and write file header
         // -----------------------------------------------------------------------
+        if let Some(bytes) = &graphic_bytes {
+            chunks.push((b"UIGR", bytes));
+        }
+        if let Some(bytes) = &button_bytes {
+            chunks.push((b"UIBT", bytes));
+        }
         let payload_size: u32 = chunks
             .iter()
             .map(|(_, data)| data.len() as u32 + CHUNK_HEADER_SIZE as u32)
@@ -549,14 +592,12 @@ impl VatfBuilder {
             length: MAGIC_BYTES.len() as u32 + mem::size_of::<Header>() as u32 + payload_size,
         };
 
-        let mut file = std::fs::File::create(&path)
-            .with_context(|| format!("Failed to create: {}", path.display()))?;
-        file.write_all(&[MAGIC_BYTES, bytemuck::cast_slice(&[file_header])].concat())?;
-
         // -----------------------------------------------------------------------
         // 3. Assemble and write payload
         // -----------------------------------------------------------------------
-        let mut raw_payload = Vec::with_capacity(payload_size as usize);
+        let mut raw_payload = Vec::with_capacity(file_header.length as usize);
+        raw_payload.extend(MAGIC_BYTES);
+        raw_payload.extend(bytemuck::bytes_of(&file_header));
         for (four_cc, data) in &chunks {
             let chunk_header = ChunkHeader {
                 chunk_type: **four_cc,
@@ -566,10 +607,7 @@ impl VatfBuilder {
             raw_payload.extend(*data);
         }
 
-        file.write_all(&raw_payload)?;
-
-        info!("Written — {} B", raw_payload.len());
-        Ok(())
+        Ok((raw_payload, report))
     }
 }
 
@@ -598,14 +636,28 @@ fn flatten_matrix_3x3_to_6(m: [[f32; 3]; 3]) -> [f32; 6] {
 /// Shared by [`convert_swf_to_vab`] and [`parse_animation_container`] so that the
 /// parsed timeline data is reachable in-process, without going through a file.
 fn build_builder(input: &Path) -> Result<VatfBuilder> {
-    if input.extension().and_then(|e| e.to_str()) != Some("swf") {
-        bail!("Not a .swf file: {}", input.display());
-    }
-
+    ensure!(
+        input.extension().and_then(|e| e.to_str()) == Some("swf"),
+        "Not a .swf file: {}",
+        input.display()
+    );
     let file = File::open(input).with_context(|| format!("Failed to open {}", input.display()))?;
+    build_builder_reader(BufReader::new(file), &SwfCompileSettings::default())
+}
 
-    let swf_buf = decompress_swf(BufReader::new(file))?;
+fn build_builder_reader(
+    reader: impl std::io::Read,
+    settings: &SwfCompileSettings,
+) -> Result<VatfBuilder> {
+    let ui = settings.mode != SwfCompileMode::Animation;
+    let animated = settings.mode == SwfCompileMode::AnimatedUi;
+    let swf_buf = decompress_swf(reader)?;
     let swf = parse_swf(&swf_buf)?;
+    let ui_sources = if ui {
+        Some(graphics::Sources::collect(&swf.tags, animated)?)
+    } else {
+        None
+    };
     let frame_rate = swf.header.frame_rate().to_f32();
 
     let mut jpeg_tables: Option<Vec<u8>> = None;
@@ -616,8 +668,13 @@ fn build_builder(input: &Path) -> Result<VatfBuilder> {
     };
     let mut animations = HashMap::default();
 
+    let tags = if let Some(source) = &ui_sources {
+        source.select(swf.tags)?
+    } else {
+        swf.tags
+    };
     parse_tags(
-        swf.tags,
+        tags,
         &mut builder,
         &mut animations,
         0,
@@ -635,6 +692,10 @@ fn build_builder(input: &Path) -> Result<VatfBuilder> {
     // Process morph shapes: interpolate + tessellate at each unique ratio.
     process_morphs(&mut builder, &bitmap)?;
 
+    if let Some(source) = ui_sources {
+        builder.buttons = source.buttons().to_vec();
+        builder.graphics = Some(source.compile(&builder)?);
+    }
     Ok(builder)
 }
 
@@ -657,25 +718,14 @@ pub fn parse_animation_container(input: &Path) -> Result<animation::AnimContaine
 ///
 /// `output` should include the `.vab` filename (e.g. `"out/anim.vab"`).
 pub fn convert_swf_to_vab(input: &Path, output: &Path) -> Result<()> {
-    let start = Instant::now();
-    let mut builder = build_builder(input)?;
-    let elapsed = start.elapsed();
-    let sprite_count = builder.animations.len();
+    convert_swf_to_vab_with_report(input, output).map(|_| ())
+}
 
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let write_start = Instant::now();
-    builder.write_vatf(output.to_path_buf())?;
-
-    info!(
-        "{} — {} sprites, parsed {:.1}s, write {:.1}s",
-        output.file_name().unwrap_or_default().to_string_lossy(),
-        sprite_count,
-        elapsed.as_secs_f64(),
-        write_start.elapsed().as_secs_f64(),
-    );
-    Ok(())
+pub fn convert_swf_to_vab_with_report(
+    input: &Path,
+    output: &Path,
+) -> Result<ResourcePruningReport> {
+    convert_swf(input, output, &SwfCompileSettings::default())
 }
 
 // ===========================================================================
@@ -1124,4 +1174,38 @@ fn process_morphs(
     info!("Built {} morph mesh entries", builder.morph_entries.len());
 
     Ok(())
+}
+
+/// Convert ExportAssets entries into a strict static, pure-vector UI library.
+pub fn convert_swf_ui_to_vab(input: &Path, output: &Path) -> Result<()> {
+    convert_swf_ui_to_vab_with_report(input, output).map(|_| ())
+}
+pub fn convert_swf_ui_to_vab_with_report(
+    input: &Path,
+    output: &Path,
+) -> Result<ResourcePruningReport> {
+    convert_swf(
+        input,
+        output,
+        &SwfCompileSettings {
+            mode: SwfCompileMode::StaticUi,
+        },
+    )
+}
+
+/// Export vector UI with automatically baked looping child timelines.
+pub fn convert_swf_animated_ui_to_vab(input: &Path, output: &Path) -> Result<()> {
+    convert_swf_animated_ui_to_vab_with_report(input, output).map(|_| ())
+}
+pub fn convert_swf_animated_ui_to_vab_with_report(
+    input: &Path,
+    output: &Path,
+) -> Result<ResourcePruningReport> {
+    convert_swf(
+        input,
+        output,
+        &SwfCompileSettings {
+            mode: SwfCompileMode::AnimatedUi,
+        },
+    )
 }

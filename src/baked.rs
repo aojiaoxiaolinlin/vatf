@@ -162,6 +162,7 @@ pub fn bake_with_skin_variants(
         skin_visiting: HashSet::new(),
         emitted: 0,
         frozen: false,
+        persistent_single_frames: false,
     };
     let mut clips = Vec::new();
     for (index, (start, name)) in starts.iter().enumerate() {
@@ -247,6 +248,7 @@ struct Compiler<'a> {
     skin_visiting: HashSet<u16>,
     emitted: usize,
     frozen: bool,
+    persistent_single_frames: bool,
 }
 
 impl Compiler<'_> {
@@ -374,7 +376,12 @@ impl Compiler<'_> {
                     as usize
             };
             self.visiting.push(object.id);
-            let result = self.list(&frames[child].entries, child, transform)?;
+            let time = if self.persistent_single_frames && frames.len() == 1 && !self.frozen {
+                frame.saturating_sub(object.place_frame as usize)
+            } else {
+                child
+            };
+            let result = self.list(&frames[child].entries, time, transform)?;
             self.visiting.pop();
             result
         } else {
@@ -442,6 +449,47 @@ impl BakedMovie {
             );
         }
         Ok(())
+    }
+}
+
+/// Bake one exported UI frame without root labels or root translation normalization.
+pub(crate) fn bake_ui_symbol(
+    container: &AnimContainer,
+    id: u16,
+    frame: usize,
+) -> Result<Vec<BakedNode>> {
+    let variants = HashMap::new();
+    let mut compiler = Compiler {
+        timelines: container
+            .animations
+            .iter()
+            .map(|(id, frames)| (*id, frames.as_slice()))
+            .collect(),
+        skin_variants: &variants,
+        skins: BTreeMap::new(),
+        visiting: Vec::new(),
+        skin_visiting: HashSet::new(),
+        emitted: 0,
+        frozen: false,
+        persistent_single_frames: true,
+    };
+    if let Some(frames) = compiler.timelines.get(&id).copied() {
+        ensure!(!frames.is_empty(), "empty UI Sprite {id}");
+        compiler.list(
+            &frames[frame % frames.len()].entries,
+            if frames.len() == 1 {
+                frame
+            } else {
+                frame % frames.len()
+            },
+            AnimTransform::default(),
+        )
+    } else {
+        Ok(vec![BakedNode::Shape {
+            id,
+            ratio: 0,
+            transform: AnimTransform::default(),
+        }])
     }
 }
 

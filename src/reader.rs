@@ -245,6 +245,99 @@ impl VabReader {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
+impl VabReader {
+    /// Optional native button state references. Older UI files need no UIBT chunk.
+    pub fn buttons(&self) -> Result<Vec<crate::graphics::Button>> {
+        let Some(data) = self.chunk_data(b"UIBT") else {
+            return Ok(vec![]);
+        };
+        let buttons: Vec<crate::graphics::Button> = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(data.len() as u64)
+            .reject_trailing_bytes()
+            .deserialize(data)
+            .context("Corrupt UIBT chunk")?;
+        let graphics = self.graphics()?;
+        let mut names: std::collections::HashSet<_> =
+            graphics.iter().map(|g| g.name.as_str()).collect();
+        for button in &buttons {
+            crate::graphics::validate_name(&button.name)?;
+            anyhow::ensure!(
+                names.insert(&button.name),
+                "duplicate UI export {}",
+                button.name
+            );
+            for state in [
+                Some(&button.up),
+                Some(&button.over),
+                Some(&button.down),
+                button.hit_test.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                anyhow::ensure!(
+                    graphics
+                        .iter()
+                        .any(|g| &g.name == state && g.frames.len() == 1),
+                    "button {} references missing/non-static state {state}",
+                    button.name
+                );
+            }
+        }
+        Ok(buttons)
+    }
+    /// Optional named static graphics. Ordinary animation files have no UIGR chunk.
+    pub fn graphics(&self) -> Result<Vec<crate::graphics::Graphic>> {
+        let Some(data) = self.chunk_data(b"UIGR") else {
+            return Ok(Vec::new());
+        };
+        let graphics: Vec<crate::graphics::Graphic> = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(data.len() as u64)
+            .reject_trailing_bytes()
+            .deserialize(data)
+            .context("Corrupt UIGR chunk")?;
+        let mut names = std::collections::HashSet::new();
+        for graphic in &graphics {
+            crate::graphics::validate_name(&graphic.name)?;
+            anyhow::ensure!(
+                names.insert(&graphic.name),
+                "duplicate UI export {}",
+                graphic.name
+            );
+            let b = graphic.source_bounds;
+            anyhow::ensure!(
+                b.iter().all(|v| v.is_finite()) && b[2] > b[0] && b[3] > b[1],
+                "invalid UI bounds for {}",
+                graphic.name
+            );
+            anyhow::ensure!(
+                !graphic.frames.is_empty() && graphic.frames.len() <= 4096,
+                "invalid UI frame count"
+            );
+            anyhow::ensure!(
+                graphic.frame_rate.is_finite()
+                    && graphic.frame_rate >= 0.0
+                    && (graphic.frames.len() == 1 || graphic.frame_rate > 0.0),
+                "invalid UI frame rate"
+            );
+            let movie = crate::baked::BakedMovie {
+                frame_rate: graphic.frame_rate,
+                skins: vec![],
+                clips: vec![crate::baked::BakedClip {
+                    name: graphic.name.clone(),
+                    start_frame: 0,
+                    frames: graphic.frames.clone(),
+                    events: vec![],
+                }],
+            };
+            movie.validate()?;
+        }
+        Ok(graphics)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

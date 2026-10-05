@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use vatf::convert_swf_to_vab;
+use vatf::{SwfCompileMode, SwfCompileSettings, convert_swf};
 
 /// SWF → VAB converter — bake Flash animations into a compact runtime format.
 #[derive(Parser)]
@@ -11,6 +11,12 @@ use vatf::convert_swf_to_vab;
 struct Cli {
     /// Input .swf file, or directory containing .swf files.
     input: PathBuf,
+    /// Export ExportAssets symbols as a strict static pure-vector UI library.
+    #[arg(long)]
+    ui: bool,
+    /// Allow child animation in exported UI.
+    #[arg(long, conflicts_with = "ui")]
+    ui_animated: bool,
 
     /// Output path.
     ///
@@ -24,10 +30,15 @@ fn main() -> Result<()> {
     let args = Cli::parse();
 
     if args.input.is_dir() {
-        convert_dir(&args.input, args.output.as_deref())?;
+        convert_dir(
+            &args.input,
+            args.output.as_deref(),
+            args.ui,
+            args.ui_animated,
+        )?;
     } else {
         let output = resolve_output(&args.input, args.output.as_deref());
-        convert_single(&args.input, &output)?;
+        convert_single(&args.input, &output, args.ui, args.ui_animated)?;
     }
 
     Ok(())
@@ -35,22 +46,41 @@ fn main() -> Result<()> {
 
 // ── Single file ─────────────────────────────────────────────────────────────
 
-fn convert_single(input: &std::path::Path, output: &std::path::Path) -> Result<()> {
+fn convert_single(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    ui: bool,
+    ui_animated: bool,
+) -> Result<()> {
     print!(
         "  Converting {} … ",
         input.file_name().unwrap_or_default().to_string_lossy()
     );
-    let result = convert_swf_to_vab(input, output);
+    let result = convert_swf(input, output, &settings(ui, ui_animated));
     match &result {
-        Ok(()) => println!("✓  ({})", format_size(file_size(output))),
+        Ok(report) => println!(
+            "✓  ({}; meshes {}→{}, resource payload {}→{}, textures {}→{})",
+            format_size(file_size(output)),
+            report.before.meshes,
+            report.after.meshes,
+            format_size(report.before.bytes as u64),
+            format_size(report.after.bytes as u64),
+            format_size(report.before.texture_bytes as u64),
+            format_size(report.after.texture_bytes as u64)
+        ),
         Err(e) => eprintln!("✗  {e:#}"),
     }
-    result
+    result.map(|_| ())
 }
 
 // ── Directory mode ──────────────────────────────────────────────────────────
 
-fn convert_dir(input_dir: &std::path::Path, output_dir: Option<&std::path::Path>) -> Result<()> {
+fn convert_dir(
+    input_dir: &std::path::Path,
+    output_dir: Option<&std::path::Path>,
+    ui: bool,
+    ui_animated: bool,
+) -> Result<()> {
     let output_dir = output_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| input_dir.join("output"));
@@ -81,10 +111,17 @@ fn convert_dir(input_dir: &std::path::Path, output_dir: Option<&std::path::Path>
         let output = output_dir.join(format!("{}.vab", stem.to_string_lossy()));
 
         print!("[{:>2}/{total}] {} … ", i + 1, stem.to_string_lossy());
-        match convert_swf_to_vab(input, &output) {
-            Ok(()) => {
+        match convert_swf(input, &output, &settings(ui, ui_animated)) {
+            Ok(report) => {
                 ok += 1;
-                println!("✓  ({})", format_size(file_size(&output)));
+                println!(
+                    "✓  ({}; meshes {}→{}, resource payload {}→{})",
+                    format_size(file_size(&output)),
+                    report.before.meshes,
+                    report.after.meshes,
+                    format_size(report.before.bytes as u64),
+                    format_size(report.after.bytes as u64)
+                );
             }
             Err(e) => {
                 errs += 1;
@@ -137,4 +174,16 @@ fn format_size(bytes: u64) -> String {
 
 fn file_size(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn settings(ui: bool, ui_animated: bool) -> SwfCompileSettings {
+    SwfCompileSettings {
+        mode: if ui_animated {
+            SwfCompileMode::AnimatedUi
+        } else if ui {
+            SwfCompileMode::StaticUi
+        } else {
+            SwfCompileMode::Animation
+        },
+    }
 }

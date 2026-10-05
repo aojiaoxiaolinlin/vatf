@@ -326,6 +326,19 @@ fn display_list_persists_objects_across_frames() {
     use swf::{Fixed16, Matrix, PlaceObjectAction, Twips};
 
     let mut tags = Vec::new();
+    // This test exercises timeline persistence, but still defines its referenced character.
+    tags.push(Tag::DefineShape(swf::Shape {
+        version: 3,
+        id: 1,
+        shape_bounds: swf::Rectangle::default(),
+        edge_bounds: swf::Rectangle::default(),
+        flags: swf::ShapeFlag::empty(),
+        styles: swf::ShapeStyles {
+            fill_styles: vec![],
+            line_styles: vec![],
+        },
+        shape: vec![],
+    }));
     for frame in 0..4u32 {
         if frame == 0 {
             tags.push(Tag::FrameLabel(swf::FrameLabel {
