@@ -9,6 +9,6 @@
 | `animated-background.png` | `background551284_export_animates_and_renders` / `background551284_408.png` |
 | `button-up.png`、`button-over.png`、`button-down.png` | `native_login_button_states_render_different_pixels` / 三种可见状态 |
 
-animx 不包含 GPU 渲染器。需要更新截图时，在接口匹配的配套插件项目运行对应 `cargo test --test render_gpu <测试名> -- --ignored --nocapture --test-threads=1`，核对输出后复制到本目录。普通 animx 测试与转换命令不需要这些 GPU 测试或相邻项目。
+vatf 不包含 GPU 渲染器。需要更新截图时，在接口匹配的配套插件项目运行对应 `cargo test --test render_gpu <测试名> -- --ignored --nocapture --test-threads=1`，核对输出后复制到本目录。普通 vatf 测试与转换命令不需要这些 GPU 测试或相邻项目。
 
 相关源 SWF 已包含在本项目 fixtures：角色、名称框、循环背景、登录按钮。素材仅用于开发验证，不能据此推定拥有原作品授权。

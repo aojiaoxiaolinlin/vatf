@@ -1,4 +1,4 @@
-# animx 技术文档
+# vatf 技术文档
 
 第一次使用请从 [项目 README](../README.md) 开始，运行命令和测试素材均可在本项目内找到。配套 Bevy 渲染器的效果展示与使用方法在 [bevy_flash_remake README](../../bevy_flash_remake/README.md)。
 
