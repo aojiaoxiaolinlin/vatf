@@ -1,5 +1,7 @@
 # 01 · `.vab` 二进制格式规范
 
+> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+
 文件格式常量定义在 `src/lib.rs:45-60`，读取实现在 `src/reader.rs`。
 
 ```rust
@@ -80,7 +82,9 @@ if header.length as usize != bytes.len() {
 | 7 | `INDX` | `[u32]` | POD | 三角形索引 |
 | 8 | `MORP` | `[MorphEntry]` | POD | morph 预插值网格表 |
 
-写端**总是写出全部 9 个 chunk**，即使内容为空——`round_trip_empty_file`（`src/reader.rs`）断言了这一点，并额外断言 `ANIM` **不**存在。
+基础写端**总是写出上述 9 个 chunk**，即使内容为空——`round_trip_empty_file`（`src/reader.rs`）断言了这一点，并额外断言 `ANIM` **不**存在。
+
+UI 文件还可写入 bincode 编码的 `UIGR`（命名图形与全部帧）和 `UIBT`（原生按钮状态引用）。普通动画不需要这些 UI chunk；具体读取契约见 [08](08-ui-and-compilation.md)。
 
 > **历史注记**：早期版本有第 10 个 chunk `ANIM`（`AnimContainer`，未展开的 per-sprite 显示列表），与 `BAKD` 并存。它占动画密集型产物 **17%–54%** 的体积，而唯一只有它才有的数据是 `frame_rate` —— 一个 f32。已删除，帧率移入 `BakedMovie::frame_rate`（[07 篇 §8](07-design-notes.md)）。
 
@@ -239,11 +243,7 @@ local_y = q_y / 32767 * bounds_half_y + bounds_center_y
 - **为什么是 32767 而不是 32768**：`i16` 的范围是 `[-32768, 32767]`。用 32767 作系数，`-q` 和 `+q` 都落在合法范围内且**对称**，不会因为 `-(-32768)` 溢出而翻车。代价是相对精度上限 `0.5 / 32767 ≈ 1.5e-5`（半宽的一个万分之一点五），远低于像素精度需求。
 - **为什么退化轴返回 0**：单点、纯水平/垂直线等形状的某个轴半宽为 0。此时除法会得到 `inf`/`NaN`，`clamp` 也救不回来。直接返回 0 表示"该轴上所有点都在中心"。
 - **`clamp` 的代价**：落在包围盒之外的几何会被**钳死**在 `±32767` 上并永久丢失信息。所以包围盒必须取对——见下一条。
-- **必须用 `edge_bounds` 而不是 `shape_bounds`**（`src/lib.rs:311-313` 的注释）：
-
-  > *"Quantise against `edge_bounds` (which includes stroke widths) rather than `shape_bounds` (fill outline only) — otherwise vertices produced by stroke expansion get clamped to ±32767 and thick strokes flatten."*
-
-  描边三角化会向外扩张出半个笔宽。若用只含填充轮廓的 `shape_bounds` 做归一化，这些外扩顶点就会全部撞上 `±32767` 被压平，粗描边的形状直接变形。这是一个**很容易踩、且症状隐蔽**的坑。
+- **量化范围必须覆盖三角化后的所有顶点**。当前实现从 SWF `shape_bounds` 开始，再纳入实际生成的填充和描边顶点（含端点、斜接）。`EdgeBounds` 不含描边扩展，单独使用会让粗描边顶点被 clamp 压平。morph 也经过同一个最终顶点范围计算。量化和落盘的 `bounds_half / bounds_center` 必须使用一致的范围。
 
 ---
 
@@ -396,22 +396,13 @@ pub struct BakedMovie {
 | 截断保护 | `src/reader.rs:110-120` | `checked_add` 防 `u32` 溢出，越界报错 |
 | 长度乘积校验 | `src/reader.rs:197-202` | 见下 |
 
-### 版本策略：编号 = 布局世代，不是兼容性策略
+### 版本策略：工作格式与编译行为分别管理
 
-`version` 与 `VAB_VERSION` 不相等就一律拒绝，**没有**"读旧版本"或"向前兼容"的路径。这个常量是 [01 篇 §1](01-format.md#1-文件布局) 里那个 `VAB_VERSION`：
+读取端要求版本精确等于 `VAB_VERSION`，不提供旧版本迁移。当前格式尚未发布，工作版本固定为 **1**；开发阶段可以原地替换 schema，不必每次小改动都增加格式版本，但所有既有 VAB 必须一起重新生成。
 
-```rust
-// src/lib.rs
-/// 这个常量是**陈旧文件探测器，不是兼容性策略**。
-/// 只要 `BAKD` 的 schema 或某个 POD 结构体的布局变了，就把它加一。
-pub const VAB_VERSION: u32 = 1;
-```
+相同版本号无法可靠识别开发期间的旧 schema：头部版本和长度通过不代表新布局可读取。不要把版本校验当成所有陈旧产物的探测器。正式发布后，不兼容的格式改动才需要提高 VAB_VERSION。
 
-要点：
-
-- 格式**从未发布**，所以编号直接重置为 `1`，不必续接历史。校验是精确相等，编号本身不承载语义。
-- **它的职责是"让陈旧文件报出清楚的错"**，而不是维护兼容。去掉它并不会让你免于重新转换——布局真变了的时候旧文件的字节就是错的，无论如何都得重转；校验只是决定这件事是"报一句 `Unsupported VAB version 3 (this build expects 1)`"还是"读出一堆垃圾"。
-- 改布局时把常量加一即可，成本是一行。**别忘了重新生成所有产物**。
+`COMPILER_REVISION` 是独立的编译器行为修订号：转换结果语义变化时递增，即使格式布局不变。配套 Bevy 插件用该修订号隔离预处理缓存；源文件和设置没变时，缓存仍须随编译器变化失效。测试与读取基准从源 SWF 生成当前产物，不依赖预生成的 VAB。
 
 ### POD 元素的隐式长度校验
 

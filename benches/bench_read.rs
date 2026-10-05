@@ -1,25 +1,15 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-/// VAB 文件读取基准测试
-///
-/// 依赖一个已生成的 .vab 产物。路径不存在、或者产物版本与本 crate 的
-/// `VAB_VERSION` 不符时（例如格式改动后还没重新转换），基准会**跳过**而不是
-/// panic —— 重新转换即可：`cargo run -- <swf 目录>`。
-///
-/// 运行：
-///   cargo bench --bench bench_read
+/// VAB 读取基准：使用项目内 SWF，在计时前生成当前格式的 VAB。
+/// SWF 编译不计入读取时间；缺失素材或编译失败会报错而不是跳过。
+/// 运行：cargo bench --bench bench_read
 fn bench_parse_vab(c: &mut Criterion) {
-    let path = r"D:\Code\Rust\bevy_flash_remake\assets\spirit2159src.vab";
-    let Ok(data) = std::fs::read(path) else {
-        eprintln!("skipping: {path} not found — run `cargo run` to regenerate it");
-        return;
-    };
-
-    // Fail early and legibly on a stale artefact instead of inside the timed loop.
-    if let Err(e) = vatf::reader::VabReader::from_bytes(&data) {
-        eprintln!("skipping: {path} is not readable by this build: {e:#}");
-        return;
-    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/spirit2159src.swf");
+    let source = std::fs::read(&path).expect("missing bundled spirit2159src.swf fixture");
+    let compiled = vatf::compile_swf(&source, &vatf::SwfCompileSettings::default())
+        .expect("failed to compile benchmark fixture");
+    let data = compiled.bytes;
+    vatf::reader::VabReader::from_bytes(&data).expect("invalid compiled benchmark VAB");
 
     let file_size = data.len();
 

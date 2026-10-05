@@ -1,5 +1,7 @@
 # 03 · 形状解析 / 镶嵌 / 渐变 / morph 插值
 
+> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+
 本篇讲几何数据从 SWF 记录变成 `.vab` 里顶点索引的完整路径。涉及文件：`src/shape_utils.rs`、`src/tessellator.rs`、`src/morph.rs`，以及 `src/lib.rs` 的 `process_shape_geometry`。
 
 ---
@@ -269,7 +271,7 @@ ShapeRecord::CurvedEdge { control_delta, anchor_delta } => {
 
 `cursor` 在构造参数之前**已经被推进到锚点**了，所以实际求的是 `anchor → control → anchor` 这条退化曲线的包围盒。真实曲线的极值点可能落在这个盒子之外，于是**包围盒可能被低估**。
 
-**当前影响有限**：`calculate_shape_bounds` 的产物只被 `morph.rs:123` 用作插值后形状的 `shape_bounds`，而落盘量化走的是 `edge_bounds`（见 [01 篇 §4](01-format.md#4-顶点量化)）。但如果将来有人拿 `shape_bounds` 做视锥剔除，这条就会变成真的渲染 bug。
+当前最终量化范围会纳入实际三角化顶点，不再仅依赖 edge_bounds；上面的源记录范围计算属于独立的历史分析，不应据此判断当前输出会裁掉描边。
 
 顺带：`stroke_width` 参数在唯一调用点恒为 `Twips::ZERO`——Ruffle 原版会给描边传真实笔宽，这里的调用没有传。
 
@@ -665,19 +667,9 @@ ShapeRecord::CurvedEdge { control_delta: control - pen, anchor_delta: anchor - c
 
 **钢笔位置的推进**（`update_pos`，`morph.rs:151-171`）：直线按 `delta`，曲线按 `control_delta + anchor_delta`（即走到锚点），`StyleChange` 按 `move_to` 绝对定位。
 
-### 9.4 `edge_bounds` 必须插值源包围盒
+### 9.4 源范围插值与最终量化范围
 
-```rust
-// morph.rs:123-126
-let shape_bounds = calculate_shape_bounds(&shape);
-// `edge_bounds` must include stroke widths. The interpolated edge records
-// carry no stroke half-widths, so interpolate the source bounds instead.
-let edge_bounds = lerp_rect(&start.edge_bounds, &end.edge_bounds, a, b);
-```
-
-**这是一处关键的闭环**：`lib.rs:311-319` 用量化顶点时用的是 `edge_bounds`，而插值后的边记录**不携带描边半宽**——无法从它们重算出正确的 `edge_bounds`。如果这里图省事用 `calculate_shape_bounds` 的产物，粗描边的 morph 形状会在 [01 篇 §4](01-format.md#4-顶点量化) 描述的那个环节被钳死压平。
-
-`shape_bounds` 则确实是从插值后的记录重算的——它不含描边，所以重算是对的。不过它继承了 §5 里那个 `quadratic_curve_bounds` 起点传错的缺陷。
+morph 会插值源范围，也会根据插值后的记录构建形状；这些源范围不能替代最终几何范围。当前所有 Shape/morph 三角化后都将实际顶点纳入量化范围，因此描边端点和斜接不会因为 EdgeBounds 未包含描边扩展而被 clamp 裁掉。具体落盘规则见 [01 · 顶点量化](01-format.md#4-顶点量化)。
 
 ### 9.5 其余插值细节
 

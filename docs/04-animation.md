@@ -1,5 +1,7 @@
 # 04 · 时间轴解析与 BAKD 烘焙
 
+> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+
 本篇讲时间轴数据的两代表示，以及"未展开的逐帧显示列表"如何变成"已展开的绘制树"。
 
 涉及文件：`src/animation.rs`、`src/baked.rs`、`src/matrix.rs`、`src/transform.rs`、`tests/swf_oracle.rs`。
@@ -9,7 +11,7 @@
 ## 1. 两代数据模型
 
 ```
-解析期（swf 类型）                    线格式（纯基元）
+解析期（swf 类型）                    编译期中间表示（纯基元）
 ─────────────────────                ─────────────────────
 lib.rs: DisplayObject          ──►   animation.rs: AnimDisplayObject
   id: CharacterId                      id: u16
@@ -29,7 +31,7 @@ lib.rs: DisplayObject          ──►   animation.rs: AnimDisplayObject
 两个好处：
 
 1. **跨版本稳定**。`.vab` 的字节布局不随 `swf` crate 升级而改变。
-2. **bincode 自描述**。全部是 `u8` / `u16` / `u32` / `f32` / `String` / `Vec`，没有 enum-with-payload、没有 `Option<Box<…>>` 嵌套，序列化形式简单且可预测。
+2. **序列化不依赖 SWF 的借用类型**。BAKD 使用自有数据模型，bincode 编解码要求匹配的 schema，并非自描述或跨任意版本兼容。AnimContainer 本身不再写入文件。
 
 ### `AnimContainer` —— 交接到烘焙器的中间类型
 
@@ -151,36 +153,13 @@ let child = if self.frozen {
 
 ### 3.1 clip 发现
 
-BAKD 不存"所有 sprite 的所有帧"，只存**少量命名 clip**。clip 的边界由根时间轴上的 **`anim_` 前缀标签**决定：
+根时间轴所有非 `event_` 标签都划分动作；`anim_` 是可选前缀，剥离后用作动作名，其他名字保持原样。无动作标签时生成覆盖全根时间轴的 `default`。
 
-```rust
-// baked.rs:101-127
-for (label, frame) in &container.labels {
-    if let Some(name) = label.strip_prefix("anim_") {
-        ensure!(!name.is_empty() && names.insert(name), "empty or duplicate animation name: {label}");
-        ensure!(*frame < root.len(), "animation {label} outside root timeline");
-        starts.push((*frame, name.to_owned()));
-    }
-}
-starts.sort();
-if starts.is_empty() { starts.push((0, "default".into())); }
-ensure!(starts[0].0 == 0, "first anim_ label must start at root frame 0");
-ensure!(starts.windows(2).all(|w| w[0].0 != w[1].0), "multiple animations start at the same frame");
-```
+第一个动作必须从根帧 0 开始，动作名和起始帧不可冲突；区间为 `[start_i, start_{i+1})`，最后一个到根时间轴末尾。当前解析器对没有前缀的原始重复标签仍可能覆盖，资源制作端应避免重复；归一化后的名字冲突会被烘焙器拒绝。
 
-规则：
+有标签的动作资源每帧最多一个根控制对象。每个动作以首个非空帧该对象的放置平移为固定偏移，从本动作各帧抵消；缩放、旋转和后续相对运动保留。空动作偏移为零。无标签的一般场景没有此限制，也不自动归零。
 
-| 规则 | 说明 |
-|---|---|
-| 只有 `anim_` 前缀的标签成为 clip | 其它标签对 BAKD 不可见 |
-| **第一个 clip 必须从根帧 0 开始** | 否则报错——不允许根时间轴开头有"没有归属"的帧 |
-| **不允许两个 clip 从同一帧开始** | 否则区间歧义 |
-| 无 `anim_` 标签时 | 合成一个名为 **`"default"`** 的 clip，覆盖整条根时间轴 |
-| `anim_` 前缀在烘焙时被**剥离** | 落盘的 `BakedClip::name` 是 `"idle"` 而不是 `"anim_idle"` |
-
-clip 的区间是 `[start_i, start_{i+1})`，最后一个到 `root.len()`。所以 **clip 恰好铺满根时间轴，无缝无重叠**。
-
-clip 命名冲突在解析期就已经拦过一次（[02 篇 §4](02-pipeline.md#4-framelabel-的三类分流)），这里是第二道防线。
+编译器不发现主 MC、不补 ShowFrame、不猜脚底锚点；这些准备工作需在制作端完成。详见 [项目 README](../README.md)。
 
 ### 3.2 事件重定基
 
@@ -225,7 +204,7 @@ for (frame, display) in root.iter().enumerate().take(end).skip(*start) {
 let transform = compose(parent, object.transform);
 ```
 
-所以**每个 `BakedNode` 携带的都是世界变换**——父链已经乘完了。这是 BAKD 的核心卖点：运行时不需要变换栈。
+普通 Shape 节点及 Skin 放置节点携带动画根空间变换；Group/Mask 不额外存变换，而 Skin 变体内部仍为局部空间。普通父链在烘焙时累积。这是 BAKD 的核心卖点：运行时不需要变换栈。
 
 ### 3.4 定时信息在 `BakedMovie::frame_rate`
 
@@ -260,12 +239,12 @@ pub enum BakedNode {
 
 | 节点 | 变换 | 空间 |
 |---|---|---|
-| `Shape` | 有 | **世界空间** |
-| `Group` | **无** | —— 子节点已经带世界变换，所以它不需要 |
-| `Skin` | 有 | **世界空间**（但变体内部的节点是 **skin 局部空间**，见 §4） |
-| `Mask` | **无** | `mask` 与 `children` 都在世界空间 |
+| `Shape` | 有 | **动画根空间** |
+| `Group` | **无** | —— 子节点已经带动画根空间变换，所以它不需要 |
+| `Skin` | 有 | **动画根空间**（但变体内部的节点是 **skin 局部空间**，见 §4） |
+| `Mask` | **无** | `mask` 与 `children` 都在动画根空间 |
 
-`Group` 和 `Mask` 不带变换不是偷懒，而是因为它们的子节点已经各自带好了世界变换——再乘一次就重复了。
+`Group` 和 `Mask` 不带变换不是偷懒，而是因为它们的子节点已经各自带好了动画根空间变换——再乘一次就重复了。
 
 ---
 
@@ -554,7 +533,7 @@ for tag in tags {
 | 测试 | 内容 |
 |---|---|
 | `display_list_persists_objects_across_frames` | **在内存里合成一个 SWF**（不需要素材文件），4 帧：第 0 帧 `Place`，1–3 帧用 `Modify` 改矩阵。断言每一帧都**仍有**这个对象且 `tx == index * 10.0`。这正是"差量 bug"的回归守卫 |
-| `oracle_matches_baked_sample` | 用真实素材 `../bevy_flash/assets/spirit2159src.swf`，先把 `root timeline 长度 == swf.header.num_frames()` 作为强结构断言，再跑完整比对 |
+| `oracle_matches_baked_sample` | 用真实素材 `fixtures/spirit2159src.swf`，先把 `root timeline 长度 == swf.header.num_frames()` 作为强结构断言，再跑完整比对 |
 | `filter_dest_rect_matches_swf_crate` | 拿真正的 `swf::BlurFilter` / `DropShadowFilter` / `BevelFilter` 调上游 `calculate_dest_rect`，和本仓库的 `filter_dest_rect` 对比——**对移植代码的差分验证** |
 
 第一个测试的合成 SWF 手法值得学：用 `swf::write::write_swf` 现场造一个最小 SWF，避开对外部素材的依赖。而第二个测试反过来依赖外部素材，**缺失时打印 "skipping" 直接返回**（`swf_oracle.rs:182-186`）——CI 上不会红，但会**静默失去覆盖**。

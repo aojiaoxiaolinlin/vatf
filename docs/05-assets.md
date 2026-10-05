@@ -1,5 +1,7 @@
 # 05 · 位图解码 / JPEG 兼容 / YUV SIMD / 滤镜
 
+> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+
 涉及文件：`src/bitmap.rs`、`src/decoder.rs`、`src/decoder/bt601.rs`、`src/decoder/error.rs`、`src/filter.rs`。
 
 > **来源说明**：这个子系统大量 vendored 自 Ruffle（`ruffle-render/src/bitmap/`）。`decoder.rs` 的注释里直接引用了上游 issue（`#8775`、`#1191`），`bt601.rs` 的测试与注释也来自上游。想深挖可以对照 Ruffle 仓库。

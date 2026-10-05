@@ -1,5 +1,7 @@
 # 07 · 关键设计决策、已知问题、未接线代码
 
+> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+
 本篇是前六篇的收束：把散落在各处的"为什么"集中起来，并如实记录通读代码时核实过的缺陷与死代码。
 
 > **本篇只记录，不修复。** 所有"已知问题"都是核实过的现状，改动它们需要单独的决策。
@@ -16,7 +18,7 @@
 |---|---|
 | `PlaceObject` 逐帧累积成显示列表 | 转换期算好，每帧存完整列表 |
 | 嵌套 sprite 各跑各的时间轴 | 烘焙期按每个根帧展开成子树 |
-| 层级变换逐层相乘 | 烘焙期乘成世界变换 |
+| 层级变换逐层相乘 | 烘焙期乘成动画根空间变换 |
 | 形状路径 → 三角形 | 转换期镶嵌好 |
 | morph 按 ratio 插值 | 转换期按出现过的 ratio 预烘焙 |
 | 渐变/位图矩阵 → 纹理坐标 | 转换期算成 uniform |
@@ -50,13 +52,9 @@
 
 代价是相对精度 `0.5/32767 ≈ 1.5e-5`（半宽的一个万分之一点五）。远低于像素精度需求，几乎免费。详见 [01 篇 §4](01-format.md#4-顶点量化)。
 
-### 2.2 为什么量化用 `edge_bounds` 而不是 `shape_bounds`
+### 2.2 量化必须覆盖实际描边顶点
 
-描边三角化会向外扩张**半个笔宽**。`shape_bounds` 只含填充轮廓，不含这个扩张量。若用它做归一化，所有描边外扩顶点都会撞上 `±32767` 被 `clamp` 压平——**粗描边的形状会明显变形**。
-
-源码注释（`lib.rs:311-313`）专门写了这一点，说明这是个踩过的坑。代价是填充区域的精度略微下降（包围盒变大了），但这是正确的取舍。
-
-**这条约束一路传导到 morph**：`morph.rs:126` 必须 **lerp 源包围盒**而不是从插值后的记录重算——因为插值记录不携带描边半宽。见 [03 篇 §9.4](03-geometry.md#94-edge_bounds-必须插值源包围盒)。
+旧分析把 SWF EdgeBounds 当作含描边范围，这个判断不正确。当前实现从 ShapeBounds 起步，再扩展到实际三角化后的顶点范围，覆盖端点、斜接及 morph 描边。最终范围用于顶点量化和 ShapeMesh 的解码元数据，避免粗描边被 clamp 压平。详见 [01 · 顶点量化](01-format.md#4-顶点量化)。
 
 ### 2.3 morph 网格为什么不写 `ShapeRecord`
 
@@ -132,7 +130,7 @@ ensure!(objects[index + 1..end].iter().all(|o| o.clip_depth <= object.clip_depth
 
 ### 2.8 为什么 `Group` 没有自己的变换
 
-`BakedNode::Group { children, filters, blend_mode }` 不带 `transform`。因为它的子节点**已经各自带好了世界变换**——烘焙期的 `compose` 是沿着整棵树累积的（[04 篇 §3.3](04-animation.md#33-变换在烘焙期就乘完)）。再加一层变换只会重复。
+`BakedNode::Group { children, filters, blend_mode }` 不带 `transform`。因为它的子节点**已经各自带好了动画根空间变换**——烘焙期的 `compose` 是沿着整棵树累积的（[04 篇 §3.3](04-animation.md#33-变换在烘焙期就乘完)）。再加一层变换只会重复。
 
 同理 `Mask` 也不带。
 
@@ -230,7 +228,7 @@ bounds = bounds.union(&quadratic_curve_bounds(
 
 **后果**：求的是 `anchor → control → anchor` 这条退化曲线的包围盒，真实曲线的极值点可能落在盒子外 → **包围盒可能被低估**。
 
-**当前影响有限**：该包围盒只被 `morph.rs:123` 用作插值后的 `shape_bounds`，而量化落盘走 `edge_bounds`。但如果将来用它做视锥剔除，会变成真的渲染 bug。
+当前最终量化范围会纳入实际三角化顶点，不再仅依赖 edge_bounds；上面的源记录范围计算属于独立的历史分析，不应据此判断当前输出会裁掉描边。
 
 **附带**：`stroke_width` 参数在唯一调用点恒传 `Twips::ZERO`，形同虚设（Ruffle 原版会传真实笔宽）。
 
@@ -361,10 +359,10 @@ match result {
 | **`place_frame` 是父时间轴的帧号** | 子时间轴位置 = `(parent - place) mod child_len` |
 | ~~BAKD 不带帧率~~ | 已修复：`BakedMovie::frame_rate` |
 | **clip 帧号是相对的，事件也是** | 根帧 = `start_frame + clip 索引` |
-| **`Skin` 变体内部是局部空间** | 要乘 `Skin.transform`；`Shape` / `Group` / `Mask` 子节点已是世界空间 |
+| **`Skin` 变体内部是局部空间** | 要乘 `Skin.transform`；`Shape` / `Group` / `Mask` 子节点已是动画根空间 |
 | **`Group` / `Mask` 没有自己的 transform** | 别多乘一次 |
 | **`blend_mode > 1` 才包装 Group** | 因为 `swf::BlendMode` 没有判别值 1（`Normal=0`, `Layer=2`） |
-| **`skin_` / `anim_` / `event_` 前缀是转换期约定** | 落盘时都被剥离了 |
+| **前缀是转换期约定** | 实例 `skin_` 得到槽位名；根 `anim_` 可选并剥离，`event_` 事件剥离；皮肤帧标签保持原名 |
 | **有帧标签 ≠ 是 skin** | 还需要实例名有 `skin_` 前缀 |
 | **滤镜 PASSES 位域位置不一** | Blur 在 bit 3–7，其余在 bit 0 起 |
 | **`num_passes` 与 `flags` 冗余** | 两个都要会读 |

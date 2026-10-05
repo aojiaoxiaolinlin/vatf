@@ -1,5 +1,7 @@
 # 06 · 读取端 API 与播放语义
 
+> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+
 本篇是写播放器/渲染器的人需要的那部分：怎么打开文件、怎么取数据、每帧要做什么。
 
 实现全部在 `src/reader.rs`。
@@ -12,7 +14,6 @@
 pub struct VabReader {
     header: Header,
     chunks: HashMap<[u8; 4], AlignedChunk>,
-    anim:   Option<AnimContainer>,
     baked:  BakedMovie,
 }
 ```
@@ -136,7 +137,7 @@ impl AlignedChunk {
 
 第 1 条放在最前面是刻意的——**在碰任何字节之前**就确定字节序假设成立，避免后面所有 `pod_read_unaligned` 读到错误的值。
 
-第 4 条是**陈旧文件探测器**：产物是旧布局时，这里会让你看到一句能直接照做的错误，而不是让 bincode 去按新布局解一堆旧字节（[01 篇 §8](01-format.md#8-版本与兼容性)）。
+第 4 条只拒绝版本号不匹配。当前未发布工作版本为 1，原地改变布局后的旧产物可能仍是 1，必须重新生成；不能依靠这一检查识别全部陈旧产物。见 [01 篇 §8](01-format.md#8-版本与兼容性)。
 
 第 12 条意味着**手工构造的 BAKD 是读不进来的**：校验器是加载器的一部分，不只是写端的自检。
 
@@ -216,20 +217,20 @@ for ev in clip.events.iter().filter(|e| e.frame as usize == playhead) {
 fn draw(nodes: &[BakedNode], parent_transform: AnimTransform, t: &mut RenderTarget) {
     for node in nodes {
         match node {
-            // ① 世界变换已经乘好了，直接用
+            // ① 动画根空间变换已经乘好了，直接用
             BakedNode::Shape { id, ratio, transform } => {
                 let mesh = resolve_shape(*id, *ratio, &t.morph_table, &t.shape_table);   // 见 §7
                 t.draw_mesh(mesh, *transform);
             }
 
-            // ② 变体是【局部空间】的，要乘上 Skin 自己的世界变换
+            // ② 变体是【局部空间】的，要乘上 Skin 自己的动画根空间变换
             BakedNode::Skin { symbol, transform, .. } => {
                 let variant = &t.skins[*symbol].variants[t.variant_for(*symbol)];
                 draw(&variant.nodes, compose(*transform, AnimTransform::default()), t);
                 //                                             ↑ 等价于：把 transform 作为新的父变换
             }
 
-            // ③ Group：子节点已带世界变换，这里只负责滤镜/混合
+            // ③ Group：子节点已带动画根空间变换，这里只负责滤镜/混合
             BakedNode::Group { children, filters, blend_mode } => {
                 t.push_offscreen(filters);
                 draw(children, AnimTransform::default(), t);   // 不再传变换
@@ -248,7 +249,7 @@ fn draw(nodes: &[BakedNode], parent_transform: AnimTransform, t: &mut RenderTarg
 }
 ```
 
-注意 ③④ 里传给子节点的父变换是**单位阵**——因为它们的子节点已经带了世界变换，再乘一次就重复了。而 ② 必须把 `Skin.transform` 传下去，因为变体是局部空间的。
+注意 ③④ 里传给子节点的父变换是**单位阵**——因为它们的子节点已经带了动画根空间变换，再乘一次就重复了。而 ② 必须把 `Skin.transform` 传下去，因为变体是局部空间的。
 
 ---
 
@@ -260,12 +261,12 @@ fn draw(nodes: &[BakedNode], parent_transform: AnimTransform, t: &mut RenderTarg
 |---|---|---|
 | `Shape` | 世界 | 直接用 |
 | `Skin` | 世界 | 用它作为**新的父变换**去渲染变体（变体内部是局部空间） |
-| `Group` | —— | 不需要；子节点自带世界变换 |
-| `Mask` | —— | `mask` 和 `children` 都在世界空间 |
+| `Group` | —— | 不需要；子节点自带动画根空间变换 |
+| `Mask` | —— | `mask` 和 `children` 都在动画根空间 |
 
 ### 组合函数
 
-世界变换的组合就是 `AnimMatrix` / `AnimColorTransform` 的乘法：
+动画根空间变换的组合就是 `AnimMatrix` / `AnimColorTransform` 的乘法：
 
 ```rust
 fn compose(parent: AnimTransform, local: AnimTransform) -> AnimTransform {
@@ -325,7 +326,7 @@ match mesh.material_type {
 BakedNode::Mask { mask: Vec<BakedNode>, children: Vec<BakedNode> }
 ```
 
-- `mask` 和 `children` **都在世界空间**（`Mask` 节点本身不带变换）。
+- `mask` 和 `children` **都在动画根空间**（`Mask` 节点本身不带变换）。
 - 渲染顺序：先画 `mask` 建立 stencil，再画 `children`（只在 stencil 通过的区域）。
 - **不需要 stencil 栈**。格式在烘焙期就禁止了交叉/嵌套的遮罩区间（[04 篇 §4.1](04-animation.md#41-list--mask-扫描)），所以任意时刻**最多只有一层活跃的遮罩**——一个深度/模板缓冲即可。
 
@@ -415,7 +416,7 @@ let local_playhead = root_frame - clip.start_frame;
 clip 区间是 `[start_i, start_{i+1})`，最后一个到根时间轴末尾（[04 篇 §3.1](04-animation.md#31-clip-发现)）。所以：
 
 - 任意根帧都**恰好属于一个** clip，没有空隙；
-- 没有 `anim_` 标签时会有唯一的 `"default"` clip 覆盖全程。
+- 没有任何非 `event_` 根标签时会有唯一的 `"default"` clip 覆盖全程。
 
 ### 事件
 
@@ -473,3 +474,7 @@ for ev in clip.events.iter().filter(|e| e.frame as usize == playhead) {
   playhead = (playhead + 1) % clip.frames.len()
   步长 = 1.0 / frame_rate
 ```
+
+## UI 读取接口
+
+`graphics() -> Result<Vec<Graphic>>` 与 `buttons() -> Result<Vec<Button>>` 读取可选 UIGR/UIBT。缺失返回空 Vec；损坏或验证失败返回错误。UI 帧率保存在 Graphic，不能只用普通 BAKD 的 frame_rate。详见 [08](08-ui-and-compilation.md)。

@@ -1,5 +1,7 @@
 # 02 · SWF → VAB 转换主流程
 
+> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+
 入口在 `src/main.rs`，核心在 `src/lib.rs` 的 `convert_swf_to_vab`（`src/lib.rs:577-627`）与 `parse_tags`（`src/lib.rs:635-757`）。
 
 ---
@@ -217,7 +219,7 @@ if name.starts_with("event_") {
 | `anim_*` | `frame_labels` | `HashMap` | **报错** |
 | 其他 | `frame_labels` | `HashMap` | 静默覆盖 |
 
-注意 `event_*` 标签**不会**进 `frame_labels`——它是完全独立的通道。而普通标签的重复是静默覆盖，只有 `anim_*` 才报错，因为只有它的重名会导致 clip 边界歧义。
+注意 `event_*` 不进入动作标签表。当前烘焙器将所有非事件根标签作为动作，`anim_` 只是可选的剥离前缀。上面的解析分支仍只对原始 `anim_*` 重复名称直接报错，其他原始同名标签会覆盖；制作端必须保持动作名唯一，不能依赖覆盖行为。烘焙器另会拒绝剥离前缀后的名称冲突、空动作名及同帧多个动作。
 
 ### 非根时间轴（sprite 自己的时间轴）
 

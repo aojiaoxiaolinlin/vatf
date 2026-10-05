@@ -183,17 +183,12 @@ fn oracle_from_swf(path: &Path) -> (HashMap<CharacterId, Vec<Vec<ExpectedObject>
 // ===========================================================================
 
 fn fixture_directory() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../bevy_flash/assets")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
 /// Converts a fixture into a temporary `.vab`, reads it back, and separately
 /// obtains the unexpanded timelines for the oracle to compare against.
-fn bake_and_read(swf_path: &Path, tag: &str) -> Option<(VabReader, AnimContainer)> {
-    if !swf_path.exists() {
-        eprintln!("skipping: fixture not found at {}", swf_path.display());
-        return None;
-    }
-
+fn bake_and_read(swf_path: &Path, tag: &str) -> (VabReader, AnimContainer) {
     let output = std::env::temp_dir()
         .join("vatf_oracle")
         .join(format!("{tag}.vab"));
@@ -202,7 +197,7 @@ fn bake_and_read(swf_path: &Path, tag: &str) -> Option<(VabReader, AnimContainer
     vatf::convert_swf_to_vab(swf_path, &output).expect("conversion failed");
     let reader = VabReader::open(&output).expect("failed to read back the baked VAB");
     let container = vatf::parse_animation_container(swf_path).expect("oracle container failed");
-    Some((reader, container))
+    (reader, container)
 }
 
 const FLOAT_TOLERANCE: f32 = 1e-4;
@@ -452,9 +447,7 @@ fn display_list_persists_objects_across_frames() {
 #[test]
 fn oracle_matches_baked_sample() {
     let swf_path = fixture_directory().join("spirit2159src.swf");
-    let Some((_reader, container)) = bake_and_read(&swf_path, "spirit2159src") else {
-        return;
-    };
+    let (_reader, container) = bake_and_read(&swf_path, "spirit2159src");
 
     let (expected, num_frames) = oracle_from_swf(&swf_path);
 
