@@ -4,8 +4,6 @@
 
 转换器提前展开显示列表、普通子 Sprite 时间轴、变换和 morph 网格。播放器按帧读取绘制树，不再运行 SWF 时间轴或 ActionScript。滤镜仍保留为参数，由渲染器在运行时执行。
 
-本项目不依赖 Bevy；配套的 [bevy_flash_remake](../bevy_flash_remake/README.md) 提供 VAB 资产加载、播放、Camera2d 渲染、矢量 UI 和可选的资产预处理。
-
 ## 快速开始
 
 需要 Rust 工具链；当前开发环境为 Rust 1.95、edition 2024。以下命令在本项目根目录执行，使用已包含的 [测试素材](fixtures/README.md)，无需安装相邻游戏项目。
