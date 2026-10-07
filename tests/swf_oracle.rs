@@ -352,7 +352,7 @@ fn display_list_persists_objects_across_frames() {
             b: Fixed16::ZERO,
             c: Fixed16::ZERO,
             d: Fixed16::ONE,
-            tx: Twips::from_pixels(frame as f64 * 10.0),
+            tx: Twips::from_pixels(100.0 + frame as f64 * 10.0),
             ty: Twips::ZERO,
         };
         tags.push(Tag::PlaceObject(Box::new(PlaceObject {
@@ -404,6 +404,31 @@ fn display_list_persists_objects_across_frames() {
 
     vatf::convert_swf_to_vab(&swf_path, &vab_path).unwrap();
     let reader = VabReader::open(&vab_path).unwrap();
+    let source_bytes = std::fs::read(&swf_path).unwrap();
+    for (policy, expected_start) in [
+        (vatf::RootTranslationPolicy::Preserve, 100.0),
+        (vatf::RootTranslationPolicy::NormalizeClipStart, 0.0),
+    ] {
+        let compiled = vatf::compile_swf(
+            &source_bytes,
+            &vatf::SwfCompileSettings {
+                root_translation: policy,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let baked = VabReader::from_bytes(&compiled.bytes).unwrap().into_baked();
+        for (index, nodes) in baked.clips[0].frames.iter().enumerate() {
+            match &nodes[0] {
+                vatf::baked::BakedNode::Shape { transform, .. } => assert_close(
+                    transform.matrix.tx,
+                    expected_start + index as f32 * 10.0,
+                    "compiled root policy",
+                ),
+                other => panic!("unexpected node: {other:?}"),
+            }
+        }
+    }
     let container = vatf::parse_animation_container(&swf_path).unwrap();
 
     let (root_id, frames) = container
@@ -437,7 +462,7 @@ fn display_list_persists_objects_across_frames() {
         assert_eq!(entry.place_frame, 0, "frame {index}: place_frame");
         assert_close(
             entry.transform.matrix.tx,
-            index as f32 * 10.0,
+            100.0 + index as f32 * 10.0,
             &format!("frame {index}: tx"),
         );
     }

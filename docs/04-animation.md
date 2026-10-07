@@ -149,7 +149,7 @@ let child = if self.frozen {
 
 ## 3. BAKD 烘焙
 
-入口：`bake_with_skin_variants`（`baked.rs:77-179`）。`bake`（`baked.rs:72-74`）只是不传 skin 变体的包装。
+入口：`bake_with_options`（接收根平移策略）；`bake_with_skin_variants` 默认保留平移（`baked.rs:77-179`）。`bake`（`baked.rs:72-74`）只是不传 skin 变体的包装。
 
 ### 3.1 clip 发现
 
@@ -157,7 +157,7 @@ let child = if self.frozen {
 
 第一个动作必须从根帧 0 开始，动作名和起始帧不可冲突；区间为 `[start_i, start_{i+1})`，最后一个到根时间轴末尾。当前解析器对没有前缀的原始重复标签仍可能覆盖，资源制作端应避免重复；归一化后的名字冲突会被烘焙器拒绝。
 
-有标签的动作资源每帧最多一个根控制对象。每个动作以首个非空帧该对象的放置平移为固定偏移，从本动作各帧抵消；缩放、旋转和后续相对运动保留。空动作偏移为零。无标签的一般场景没有此限制，也不自动归零。
+默认 Preserve 保留作者的根平移。显式 NormalizeClipStart 模式下，有标签的动作资源每帧最多一个根控制对象。每个动作以首个非空帧该对象的放置平移为固定偏移，从本动作各帧抵消；缩放、旋转和后续相对运动保留。空动作偏移为零。无标签的一般场景没有此限制，也不自动归零。
 
 编译器不发现主 MC、不补 ShowFrame、不猜脚底锚点；这些准备工作需在制作端完成。详见 [项目 README](../README.md)。
 
@@ -727,3 +727,11 @@ DropShadow 按角度算出偏移向量，**只扩张影子落向的那一边**�
 ### 滤镜在线格式里的编码
 
 这部分细节（`num_passes` 与 `flags` 的冗余、各位域的含义）归 [05 篇 §7](05-assets.md#7-滤镜的两套类型)。
+
+## 根平移策略更新（2026-10-07）
+
+默认编译保留原始根平移（`RootTranslationPolicy::Preserve`）。上述自动归零说明
+仅适用于显式选择 `NormalizeClipStart` 的动作素材表；CLI 使用
+`--normalize-clip-start`，共享 `SwfCompileSettings` 使用 `root_translation` 字段。
+设置缺省字段兼容旧元数据，但缺省语义现在为保留。UI 导出和无标签场景不受影响。
+编译器修订号更新为 2，VAB 格式版本仍为 1。

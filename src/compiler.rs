@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{io::Cursor, path::Path};
 
 /// Increment when compiler behavior changes, independently of the VAB layout version.
-pub const COMPILER_REVISION: u32 = 1;
+pub const COMPILER_REVISION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwfCompileMode {
@@ -18,10 +18,24 @@ pub enum SwfCompileMode {
     AnimatedUi,
 }
 
+/// Root placement policy for labelled animation clips; exported UI is unaffected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RootTranslationPolicy {
+    /// Keep the author's shared coordinate space and placement compensation.
+    #[default]
+    Preserve,
+    /// Subtract each clip's first populated root placement from all its frames.
+    /// Requires at most one controlling root object per frame.
+    NormalizeClipStart,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwfCompileSettings {
     pub mode: SwfCompileMode,
+    /// Defaults to Preserve when omitted from existing processor metadata.
+    #[serde(default)]
+    pub root_translation: RootTranslationPolicy,
 }
 
 pub struct CompiledVab {

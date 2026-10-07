@@ -3,7 +3,8 @@ pub mod baked;
 mod bitmap;
 mod compiler;
 pub use compiler::{
-    COMPILER_REVISION, CompiledVab, SwfCompileMode, SwfCompileSettings, compile_swf, convert_swf,
+    COMPILER_REVISION, CompiledVab, RootTranslationPolicy, SwfCompileMode, SwfCompileSettings,
+    compile_swf, convert_swf,
 };
 mod decoder;
 pub mod filter;
@@ -289,6 +290,7 @@ impl DisplayObject {
 
 #[derive(Default)]
 pub struct VatfBuilder {
+    pub root_translation: RootTranslationPolicy,
     pub graphics: Option<Vec<graphics::Graphic>>,
     pub buttons: Vec<graphics::Button>,
     pub shape_records: Vec<ShapeRecord>,
@@ -538,7 +540,12 @@ impl VatfBuilder {
         let baked = if self.graphics.is_some() {
             baked::BakedMovie::default()
         } else {
-            baked::bake_with_skin_variants(&container, &self.event_labels, &self.skin_variants)?
+            baked::bake_with_options(
+                &container,
+                &self.event_labels,
+                &self.skin_variants,
+                self.root_translation,
+            )?
         };
         baked.validate()?;
         let (resources, report) = pruning::Resources::compact(
@@ -663,6 +670,7 @@ fn build_builder_reader(
     let mut jpeg_tables: Option<Vec<u8>> = None;
     let mut bitmap = HashMap::new();
     let mut builder = VatfBuilder {
+        root_translation: settings.root_translation,
         frame_rate,
         ..Default::default()
     };
@@ -1189,6 +1197,7 @@ pub fn convert_swf_ui_to_vab_with_report(
         output,
         &SwfCompileSettings {
             mode: SwfCompileMode::StaticUi,
+            ..Default::default()
         },
     )
 }
@@ -1206,6 +1215,7 @@ pub fn convert_swf_animated_ui_to_vab_with_report(
         output,
         &SwfCompileSettings {
             mode: SwfCompileMode::AnimatedUi,
+            ..Default::default()
         },
     )
 }

@@ -6,14 +6,18 @@
 
 ```rust
 pub enum SwfCompileMode { Animation, StaticUi, AnimatedUi }
-pub struct SwfCompileSettings { pub mode: SwfCompileMode }
+pub enum RootTranslationPolicy { Preserve, NormalizeClipStart }
+pub struct SwfCompileSettings {
+    pub mode: SwfCompileMode,
+    pub root_translation: RootTranslationPolicy,
+}
 pub struct CompiledVab {
     pub bytes: Vec<u8>,
     pub pruning: ResourcePruningReport,
 }
 ```
 
-`SwfCompileSettings::default()` 选择 Animation。设置支持 serde，未知字段会报错。`compile_swf(&[u8], &settings)` 不读写文件；`convert_swf(&Path, &Path, &settings)` 创建输出父目录并写入文件，返回裁剪报告。CLI 和 Bevy 处理器使用相同入口。
+`SwfCompileSettings::default()` 选择 Animation + Preserve。设置支持 serde，未知字段会报错。`compile_swf(&[u8], &settings)` 不读写文件；`convert_swf(&Path, &Path, &settings)` 创建输出父目录并写入文件，返回裁剪报告。CLI 和 Bevy 处理器使用相同入口。
 
 普通动画保留根动作与事件、预展开普通 Sprite、共享命名皮肤变体。UI 模式使用 ExportAssets 导出库，源根舞台不是 UI 资产自身的显示内容。
 
@@ -91,3 +95,11 @@ let buttons = reader.buttons()?;
 处理器把源 SWF 转成 VAB bytes，同时生成 VabLoader 元数据。它不修改逻辑资产路径，所以 UI 子资产仍通过 `.swf#export` 加载。正式应用可以不编译处理器 feature，只分发已处理字节和元数据。
 
 Bevy 的源内容/元数据哈希不能感知编译器代码变化。`COMPILER_REVISION` 在编译行为变化时递增，配套 `vab_processed_asset_path` 为缓存路径加修订命名空间。VAB_VERSION 则是文件格式版本，当前未发布工作版本为 1；开发阶段原地改 schema 后仍须重编译全部产物。两者职责不同。
+
+## 根平移策略更新（2026-10-07）
+
+默认编译保留原始根平移（`RootTranslationPolicy::Preserve`）。上述自动归零说明
+仅适用于显式选择 `NormalizeClipStart` 的动作素材表；CLI 使用
+`--normalize-clip-start`，共享 `SwfCompileSettings` 使用 `root_translation` 字段。
+设置缺省字段兼容旧元数据，但缺省语义现在为保留。UI 导出和无标签场景不受影响。
+编译器修订号更新为 2，VAB 格式版本仍为 1。

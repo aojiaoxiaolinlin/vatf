@@ -88,6 +88,21 @@ pub fn bake_with_skin_variants(
     extra_events: &[(Box<str>, usize)],
     skin_variants: &HashMap<u16, Vec<(Box<str>, usize)>>,
 ) -> Result<BakedMovie> {
+    bake_with_options(
+        container,
+        extra_events,
+        skin_variants,
+        crate::RootTranslationPolicy::Preserve,
+    )
+}
+
+/// Bake with an explicit root placement policy. No policy changes source timelines.
+pub fn bake_with_options(
+    container: &AnimContainer,
+    extra_events: &[(Box<str>, usize)],
+    skin_variants: &HashMap<u16, Vec<(Box<str>, usize)>>,
+    root_translation: crate::RootTranslationPolicy,
+) -> Result<BakedMovie> {
     let mut timelines = HashMap::new();
     for (id, frames) in &container.animations {
         ensure!(
@@ -167,7 +182,9 @@ pub fn bake_with_skin_variants(
     let mut clips = Vec::new();
     for (index, (start, name)) in starts.iter().enumerate() {
         let end = starts.get(index + 1).map_or(root.len(), |next| next.0);
-        let origin = if has_labelled_clips {
+        let origin = if has_labelled_clips
+            && root_translation == crate::RootTranslationPolicy::NormalizeClipStart
+        {
             clip_root_origin(root, *start, end, name)?
         } else {
             (0.0, 0.0)
@@ -559,7 +576,7 @@ mod tests {
         match &result.clips[1].frames[1][0] {
             BakedNode::Shape { id, transform, .. } => {
                 assert_eq!(*id, 1);
-                assert_eq!(transform.matrix.tx, 2.0);
+                assert_eq!(transform.matrix.tx, 12.0);
             }
             _ => panic!("ordinary sprite must be expanded"),
         }
@@ -734,7 +751,20 @@ mod tests {
             )],
         };
 
-        let result = bake(&container, &[]).unwrap();
+        let preserved = bake(&container, &[]).unwrap();
+        match &preserved.clips[1].frames[0][0] {
+            BakedNode::Shape { transform, .. } => {
+                assert_eq!((transform.matrix.tx, transform.matrix.ty), (500.0, -30.0))
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
+        let result = bake_with_options(
+            &container,
+            &[],
+            &HashMap::new(),
+            crate::RootTranslationPolicy::NormalizeClipStart,
+        )
+        .unwrap();
         let translation = |clip: usize, frame: usize| match &result.clips[clip].frames[frame][0] {
             BakedNode::Shape { transform, .. } => (transform.matrix.tx, transform.matrix.ty),
             other => panic!("unexpected node: {other:?}"),
@@ -745,14 +775,22 @@ mod tests {
     }
 
     #[test]
-    fn multiple_root_objects_in_an_animation_are_rejected() {
+    fn only_normalization_rejects_multiple_root_objects() {
         let container = AnimContainer {
             frame_rate: 30.0,
             labels: vec![("IDLE".into(), 0)],
             animations: vec![(0, vec![frame(vec![object(1, 1, 0.0), object(2, 2, 0.0)])])],
         };
 
-        let error = bake(&container, &[]).unwrap_err().to_string();
+        assert_eq!(bake(&container, &[]).unwrap().clips[0].frames[0].len(), 2);
+        let error = bake_with_options(
+            &container,
+            &[],
+            &HashMap::new(),
+            crate::RootTranslationPolicy::NormalizeClipStart,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("IDLE root frame 0 has 2 objects"), "{error}");
     }
 

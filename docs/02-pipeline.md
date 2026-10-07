@@ -274,7 +274,7 @@ let morph_bytes: &[u8] = bytemuck::cast_slice(&self.morph_entries);
 let container = animation::AnimContainer::from_parts(
     &self.animations, &self.frame_labels, self.frame_rate,
 );
-let baked = baked::bake_with_skin_variants(&container, &self.event_labels, &self.skin_variants)?;
+let baked = baked::bake_with_options(&container, &self.event_labels, &self.skin_variants, self.root_translation)?;
 baked.validate()?;
 let baked_bytes = bincode::serialize(&baked)?;
 ```
@@ -306,7 +306,7 @@ file.write_all(&[MAGIC_BYTES, bytemuck::cast_slice(&[file_header])].concat())?;
 
 先写文件头，再逐 chunk 组装到 `raw_payload` 里一次性写出。
 
-### `bake_with_skin_variants` 是唯一的烘焙调用点
+### `bake_with_options` 是序列化入口的烘焙调用点
 
 ```rust
 pub fn bake(container: &AnimContainer, extra_events: &[(Box<str>, usize)]) -> Result<BakedMovie> {
@@ -395,3 +395,11 @@ for &(morph_id, ratio) in &pairs {
 | 索引用 `u32` | `lib.rs:363` | 没有按顶点数降级到 `u16` |
 
 对比之下**没有**做的：帧间差分压缩、顶点/索引的跨 shape 复用、索引宽度自适应。这些都是可以继续优化的方向（见 [07 篇](07-design-notes.md)）。
+
+## 根平移策略更新（2026-10-07）
+
+默认编译保留原始根平移（`RootTranslationPolicy::Preserve`）。上述自动归零说明
+仅适用于显式选择 `NormalizeClipStart` 的动作素材表；CLI 使用
+`--normalize-clip-start`，共享 `SwfCompileSettings` 使用 `root_translation` 字段。
+设置缺省字段兼容旧元数据，但缺省语义现在为保留。UI 导出和无标签场景不受影响。
+编译器修订号更新为 2，VAB 格式版本仍为 1。

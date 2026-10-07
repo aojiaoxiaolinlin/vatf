@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use vatf::{SwfCompileMode, SwfCompileSettings, convert_swf};
+use vatf::{RootTranslationPolicy, SwfCompileMode, SwfCompileSettings, convert_swf};
 
 /// SWF → VAB converter — bake Flash animations into a compact runtime format.
 #[derive(Parser)]
@@ -17,6 +17,10 @@ struct Cli {
     /// Allow child animation in exported UI.
     #[arg(long, conflicts_with = "ui")]
     ui_animated: bool,
+
+    /// Remove each labelled animation's initial root placement translation.
+    #[arg(long, conflicts_with_all = ["ui", "ui_animated"])]
+    normalize_clip_start: bool,
 
     /// Output path.
     ///
@@ -35,10 +39,17 @@ fn main() -> Result<()> {
             args.output.as_deref(),
             args.ui,
             args.ui_animated,
+            args.normalize_clip_start,
         )?;
     } else {
         let output = resolve_output(&args.input, args.output.as_deref());
-        convert_single(&args.input, &output, args.ui, args.ui_animated)?;
+        convert_single(
+            &args.input,
+            &output,
+            args.ui,
+            args.ui_animated,
+            args.normalize_clip_start,
+        )?;
     }
 
     Ok(())
@@ -51,12 +62,17 @@ fn convert_single(
     output: &std::path::Path,
     ui: bool,
     ui_animated: bool,
+    normalize_clip_start: bool,
 ) -> Result<()> {
     print!(
         "  Converting {} … ",
         input.file_name().unwrap_or_default().to_string_lossy()
     );
-    let result = convert_swf(input, output, &settings(ui, ui_animated));
+    let result = convert_swf(
+        input,
+        output,
+        &settings(ui, ui_animated, normalize_clip_start),
+    );
     match &result {
         Ok(report) => println!(
             "✓  ({}; meshes {}→{}, resource payload {}→{}, textures {}→{})",
@@ -80,6 +96,7 @@ fn convert_dir(
     output_dir: Option<&std::path::Path>,
     ui: bool,
     ui_animated: bool,
+    normalize_clip_start: bool,
 ) -> Result<()> {
     let output_dir = output_dir
         .map(|p| p.to_path_buf())
@@ -111,7 +128,11 @@ fn convert_dir(
         let output = output_dir.join(format!("{}.vab", stem.to_string_lossy()));
 
         print!("[{:>2}/{total}] {} … ", i + 1, stem.to_string_lossy());
-        match convert_swf(input, &output, &settings(ui, ui_animated)) {
+        match convert_swf(
+            input,
+            &output,
+            &settings(ui, ui_animated, normalize_clip_start),
+        ) {
             Ok(report) => {
                 ok += 1;
                 println!(
@@ -176,8 +197,13 @@ fn file_size(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-fn settings(ui: bool, ui_animated: bool) -> SwfCompileSettings {
+fn settings(ui: bool, ui_animated: bool, normalize_clip_start: bool) -> SwfCompileSettings {
     SwfCompileSettings {
+        root_translation: if normalize_clip_start {
+            RootTranslationPolicy::NormalizeClipStart
+        } else {
+            RootTranslationPolicy::Preserve
+        },
         mode: if ui_animated {
             SwfCompileMode::AnimatedUi
         } else if ui {

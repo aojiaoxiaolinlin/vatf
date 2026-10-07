@@ -10,7 +10,7 @@
 
 ```sh
 # 普通动画
-cargo run --release -- fixtures/spirit2159src.swf -o target/examples/spirit2159src.vab
+cargo run --release -- fixtures/spirit2159src.swf --normalize-clip-start -o target/examples/spirit2159src.vab
 
 # 静态矢量 UI：导出名 button_background
 cargo run --release -- fixtures/ui_demo.swf --ui -o target/examples/ui_demo.vab
@@ -39,7 +39,7 @@ cargo run --release -- fixtures/login.swf --ui -o target/examples/login.vab
 - 根 MC 就是动画根。转换器不会寻找主动画、补根帧或自动对齐子动画时长；源文件应先完成帧提取和时长对齐。
 - 根级每个非 `event_` 标签划分一个动作。`anim_idle` 暴露为 `idle`，`ATTACK` 保留为 `ATTACK`；无动作标签时生成覆盖根时间轴的 `default`。
 - 第一个动作从第 0 帧开始，动作名称和起始帧不得重复。动作覆盖到下一个标签之前，最后一个到根时间轴末尾。
-- 有动作标签的资源，每帧最多一个根控制对象。编译器抵消每个动作首个非空帧的根对象放置平移，保留缩放、旋转和之后的相对运动。这不是脚底锚点推断；无标签的一般场景保留原坐标。
+- 默认 `RootTranslationPolicy::Preserve` 保留根放置平移，包括作者用于动作对齐的补偿。需要将分散摆放的动作归零时，使用 `--normalize-clip-start`，或设置 `root_translation: RootTranslationPolicy::NormalizeClipStart`。此策略要求每帧最多一个根控制对象，整段减去首个非空帧的平移，保留缩放、旋转及相对运动；空动作偏移为零，无标签场景和导出 UI 不受影响。不要逐帧归零或用动态 bounds 推断锚点。已有 VAB 无法恢复被删除的平移，需从 SWF 重新转换。
 - `event_hit` 成为动作局部帧上的 `hit` 事件。事件响应、播放队列、fallback、死亡动画终态等属于播放器 API。
 - 皮肤通过 `skin_<slot>` 实例名标记 Sprite；该 Sprite 内唯一、非空的帧标签直接作为变体名，无需 `variant_` 前缀。没有标签的帧不参与选择，变体中的普通子动画冻结为静态快照。
 - SWF 原点和 Y 向下的坐标仍是资源坐标；Bevy 实体位置、镜像、舞台适配由播放器处理。
@@ -59,7 +59,7 @@ use vatf::{SwfCompileMode, SwfCompileSettings, compile_swf, reader::VabReader};
 
 fn main() -> anyhow::Result<()> {
     let source = std::fs::read("fixtures/ui_demo.swf")?;
-    let settings = SwfCompileSettings { mode: SwfCompileMode::StaticUi };
+    let settings = SwfCompileSettings { mode: SwfCompileMode::StaticUi, ..Default::default() };
     let compiled = compile_swf(&source, &settings)?;
     std::fs::write("ui.vab", &compiled.bytes)?;
 
