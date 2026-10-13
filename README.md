@@ -120,6 +120,8 @@ Bevy 的 `VabAssetProcessorPlugin` 直接调用 `compile_swf`，不启动 CLI，
 
 以下检查在完整 Git 仓库中执行。
 
+推送到 `main` 或提交以 `main` 为目标的 PR 时，GitHub Actions 的 **CI** 工作流会自动运行 `cargo test --locked` 和 `cargo fmt --all --check`。格式检查只检查，不自动修改代码；不通过时在本地运行 `cargo fmt --all` 后提交修改。
+
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
