@@ -2,11 +2,19 @@
 name = "vatf"
 version = "0.1.0"
 edition = "2024"
+authors = ["aojiaoxiaolinlin"]
+description = "Compile SWF animations and vector animations into baked VAB assets"
+repository = "https://github.com/aojiaoxiaolinlin/vatf"
+readme = "README.md"
+keywords = ["swf", "flash", "animation", "vector", "converter"]
+categories = ["graphics", "multimedia"]
+license = "Apache-2.0"
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-APACHE"]
 
 [dependencies]
 anyhow = "1.0.102"
 bincode = "1"
-bytemuck = {version = "1.25.0", features = ["derive"]}
+bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 flate2 = "1.1.9"
