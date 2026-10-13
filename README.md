@@ -131,6 +131,19 @@ cargo bench --bench bench_read
 
 读取基准在计时前从同一份 SWF 编译当前格式的 VAB，测量 `VabReader::from_bytes`，不把 SWF 编译耗时计入读取耗时。它不测 Bevy 加载、GPU 渲染或滤镜性能。
 
+## 构建 GitHub 发布版本
+
+仓库包含 `.github/workflows/release.yml`。推送与 `Cargo.toml` 版本一致的 `v` 标签后，GitHub Actions 会先运行测试，再构建 Windows x64、Linux x64 和 macOS ARM64 的 CLI 发布包，附带 README、许可证和 SHA-256 校验文件，并创建 GitHub Release。Linux 产物在 Ubuntu 24.04 上构建，需要兼容的 glibc 环境；macOS 产物面向 Apple Silicon。
+
+先提交并推送工作流和版本变更，再推送标签。例如当前版本为 `0.1.0` 时：
+
+```sh
+git tag -a v0.1.0 -m "Release vatf 0.1.0"
+git push origin v0.1.0
+```
+
+标签版本不匹配时工作流会失败。带有 `-` 后缀的版本（例如 `v0.2.0-rc.1`）会标记为预发布。也可以在 GitHub 的 Actions 页面手动运行 **Build release**，只构建可下载的产物，不创建 Release。工作流使用 GitHub 自动提供的令牌，无需配置额外 Secret；crates.io 发布仍通过 `cargo publish` 单独执行。
+
 ## 渲染效果
 
 以下图片来自配套 Bevy 渲染器的真实 GPU 验证输出；vatf 自身只做转换，不负责绘制。图片与素材均保存在本项目内。
