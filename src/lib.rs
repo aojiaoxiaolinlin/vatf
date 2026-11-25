@@ -1,10 +1,11 @@
 pub mod animation;
 pub mod baked;
 mod bitmap;
+pub(crate) mod compact;
 mod compiler;
 pub use compiler::{
     COMPILER_REVISION, CompiledVab, RootTranslationPolicy, SwfCompileMode, SwfCompileSettings,
-    compile_swf, convert_swf,
+    VabCompression, compile_swf, convert_swf,
 };
 mod decoder;
 pub mod filter;
@@ -20,15 +21,16 @@ pub mod transform;
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
-    io::{BufReader, Cursor},
+    io::{BufReader, Cursor, Write},
     mem,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use bytemuck::{Pod, Zeroable};
+use flate2::{Compression, write::DeflateEncoder};
 use image::{ImageBuffer, ImageFormat, Rgba};
 use swf::{
     BlendMode, CharacterId, Depth, GradientInterpolation, GradientSpread, PlaceObject, Shape, Tag,
@@ -58,17 +60,48 @@ pub const MAGIC_BYTES: &[u8; 4] = b"VATF";
 /// `BAKD` schema or a POD struct's layout changes, so that files left over from
 /// an older build fail with a clear message instead of being silently
 /// misparsed. Re-converting the source `.swf` is the only remedy either way.
-pub const VAB_VERSION: u32 = 1;
+pub const VAB_VERSION: u32 = 2;
+
+/// Chunk-level compression codecs used in [`ChunkHeader::compression`].
+pub mod compression {
+    pub const NONE: u8 = 0;
+    pub const LZ4: u8 = 1;
+    pub const DEFLATE: u8 = 2;
+}
+
+/// Index buffer element widths used in [`ShapeMesh::index_format`].
+pub mod index_format {
+    /// 32-bit indices stored in the `INDX` chunk.
+    pub const U32: u16 = 0;
+    /// 16-bit indices stored in the `IND2` chunk.
+    pub const U16: u16 = 1;
+}
+
+/// Texture payload encodings used in [`TextureRecord::encoding`].
+pub mod texture_encoding {
+    pub const WEBP: u8 = 0;
+    pub const RAW_RGBA8: u8 = 1;
+}
+
+/// Sentinel [`ShapeMesh::texture_index`] value for untextured solid-color meshes.
+pub const NO_TEXTURE: u32 = u32::MAX;
 
 #[cfg(test)]
 mod texture_tests {
     #[test]
     fn repeated_texture_payload_is_stored_once() {
         let mut builder = super::VatfBuilder::default();
-        let first = builder.intern_texture(&[1, 2, 3]);
-        assert_eq!(first, builder.intern_texture(&[1, 2, 3]));
-        assert_ne!(first, builder.intern_texture(&[4, 5, 6]));
+        let first = builder.intern_texture(&[1, 2, 3], 1, 1, super::texture_encoding::WEBP);
+        assert_eq!(
+            first,
+            builder.intern_texture(&[1, 2, 3], 1, 1, super::texture_encoding::WEBP)
+        );
+        assert_ne!(
+            first,
+            builder.intern_texture(&[4, 5, 6], 2, 1, super::texture_encoding::WEBP)
+        );
         assert_eq!(builder.texture.len(), 6);
+        assert_eq!(builder.texture_records.len(), 2);
     }
 }
 
@@ -89,7 +122,24 @@ pub struct Header {
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct ChunkHeader {
     pub chunk_type: [u8; 4],
+    /// Stored byte length in the file following this header.
     pub length: u32,
+    /// Uncompressed payload byte length (`== length` when `compression == NONE`).
+    pub uncompressed_length: u32,
+    /// Codec discriminant from [`crate::compression`].
+    pub compression: u8,
+    pub _reserved: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct TextureRecord {
+    pub offset: u32,
+    pub length: u32,
+    pub width: u16,
+    pub height: u16,
+    pub encoding: u8,
+    pub _pad: [u8; 3],
 }
 
 #[repr(C)]
@@ -126,8 +176,11 @@ pub struct ShapeMesh {
     pub index_offset: u32,
     pub material_type: u16,
     pub sampler_flags: u16,
-    pub texture_offset: u32,
-    pub texture_length: u32,
+    /// Index into `TEXD` (`NO_TEXTURE` for solid-color meshes).
+    pub texture_index: u32,
+    /// Index element width discriminant from [`crate::index_format`].
+    pub index_format: u16,
+    pub _pad: u16,
     pub material_offset: u32,
     /// Bounding-box half-extents for vertex unquantization.
     /// Player: `local_x = q_x / 32767 * b_half_x + bounds_center_x`
@@ -297,8 +350,9 @@ pub struct VatfBuilder {
     pub shape_meshes: Vec<ShapeMesh>,
     pub gradient_uniforms: Vec<GradientUniforms>,
     pub bitmap_uniforms: Vec<[f32; 6]>,
+    pub texture_records: Vec<TextureRecord>,
     pub texture: Vec<u8>,
-    pub texture_lookup: HashMap<Vec<u8>, (u32, u32)>,
+    pub texture_lookup: HashMap<(Vec<u8>, u16, u16, u8), u32>,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub frame_labels: HashMap<Box<str>, usize>,
@@ -320,14 +374,25 @@ pub struct VatfBuilder {
 }
 
 impl VatfBuilder {
-    fn intern_texture(&mut self, bytes: &[u8]) -> (u32, u32) {
-        if let Some(entry) = self.texture_lookup.get(bytes) {
-            return *entry;
+    pub fn intern_texture(&mut self, bytes: &[u8], width: u16, height: u16, encoding: u8) -> u32 {
+        let key = (bytes.to_vec(), width, height, encoding);
+        if let Some(&index) = self.texture_lookup.get(&key) {
+            return index;
         }
-        let entry = (self.texture.len() as u32, bytes.len() as u32);
+        let offset = self.texture.len() as u32;
+        let length = bytes.len() as u32;
         self.texture.extend_from_slice(bytes);
-        self.texture_lookup.insert(bytes.to_vec(), entry);
-        entry
+        let index = self.texture_records.len() as u32;
+        self.texture_records.push(TextureRecord {
+            offset,
+            length,
+            width,
+            height,
+            encoding,
+            _pad: [0; 3],
+        });
+        self.texture_lookup.insert(key, index);
+        index
     }
     /// Tessellate an SWF shape and store its geometry in the builder.
     ///
@@ -405,8 +470,9 @@ impl VatfBuilder {
                         index_offset,
                         material_type: material::COLOR,
                         sampler_flags: 0,
-                        texture_offset: 0,
-                        texture_length: 0,
+                        texture_index: NO_TEXTURE,
+                        index_format: index_format::U32,
+                        _pad: 0,
                         material_offset: 0,
                         bounds_half_x: b_half_x,
                         bounds_half_y: b_half_y,
@@ -424,7 +490,8 @@ impl VatfBuilder {
                     let material_offset = self.gradient_uniforms.len() as u32;
                     self.gradient_uniforms.push(gradient_uniforms);
 
-                    let (texture_offset, texture_length) = self.intern_texture(gradient);
+                    let texture_index =
+                        self.intern_texture(gradient, 256, 1, texture_encoding::WEBP);
 
                     self.shape_meshes.push(ShapeMesh {
                         vertex_count,
@@ -433,8 +500,9 @@ impl VatfBuilder {
                         index_offset,
                         material_type: material::GRADIENT,
                         sampler_flags: 0,
-                        texture_offset,
-                        texture_length,
+                        texture_index,
+                        index_format: index_format::U32,
+                        _pad: 0,
                         material_offset,
                         bounds_half_x: b_half_x,
                         bounds_half_y: b_half_y,
@@ -465,7 +533,12 @@ impl VatfBuilder {
                     img.write_to(&mut webp_buf, ImageFormat::WebP).unwrap();
                     let webp_bytes = webp_buf.into_inner();
 
-                    let (texture_offset, texture_length) = self.intern_texture(&webp_bytes);
+                    let texture_index = self.intern_texture(
+                        &webp_bytes,
+                        u16::try_from(w).unwrap_or(u16::MAX),
+                        u16::try_from(h).unwrap_or(u16::MAX),
+                        texture_encoding::WEBP,
+                    );
 
                     let material_offset = self.bitmap_uniforms.len() as u32;
                     self.bitmap_uniforms
@@ -479,8 +552,9 @@ impl VatfBuilder {
                         material_type: material::BITMAP,
                         sampler_flags: u16::from(bm.is_smoothed)
                             | (u16::from(bm.is_repeating) << 1),
-                        texture_offset,
-                        texture_length,
+                        texture_index,
+                        index_format: index_format::U32,
+                        _pad: 0,
                         material_offset,
                         bounds_half_x: b_half_x,
                         bounds_half_y: b_half_y,
@@ -523,6 +597,14 @@ impl VatfBuilder {
 
     /// Serialize compact resources without altering source timelines or offsets.
     pub fn to_vab_bytes(&self) -> Result<(Vec<u8>, ResourcePruningReport)> {
+        self.to_vab_bytes_with_compression(VabCompression::default())
+    }
+
+    /// Serialize compact resources with the requested chunk compression codec.
+    pub fn to_vab_bytes_with_compression(
+        &self,
+        compression_mode: VabCompression,
+    ) -> Result<(Vec<u8>, ResourcePruningReport)> {
         if cfg!(target_endian = "big") {
             bail!("VATF POD chunks require a little-endian host");
         }
@@ -557,12 +639,14 @@ impl VatfBuilder {
         let shape_meshes = bytemuck::cast_slice(&resources.meshes);
         let gradient_uniforms = bytemuck::cast_slice(&resources.gradients);
         let bitmap_uniforms = bytemuck::cast_slice(&resources.bitmaps);
+        let texture_records = bytemuck::cast_slice(&resources.textures);
         let texture: &[u8] = &resources.texture;
         let vertices = bytemuck::cast_slice(&resources.vertices);
-        let indices = bytemuck::cast_slice(&resources.indices);
+        let indices_u32 = bytemuck::cast_slice(&resources.indices_u32);
+        let indices_u16 = bytemuck::cast_slice(&resources.indices_u16);
         let morph_bytes: &[u8] = bytemuck::cast_slice(&resources.morphs);
-        let baked_bytes = bincode::serialize(&baked)?;
-        let graphic_bytes = self.graphics.as_ref().map(bincode::serialize).transpose()?;
+        let baked_bytes = compact::encode_movie(&baked);
+        let graphic_bytes = self.graphics.as_deref().map(compact::encode_graphics);
         let button_bytes = if self.buttons.is_empty() {
             None
         } else {
@@ -574,14 +658,16 @@ impl VatfBuilder {
             (b"SHME", shape_meshes),
             (b"GRAD", gradient_uniforms),
             (b"BMAP", bitmap_uniforms),
+            (b"TEXD", texture_records),
             (b"TEXT", texture),
             (b"VERT", vertices),
-            (b"INDX", indices),
+            (b"INDX", indices_u32),
+            (b"IND2", indices_u16),
             (b"MORP", morph_bytes),
         ];
 
         // -----------------------------------------------------------------------
-        // 2. Compute sizes and write file header
+        // 2. Compress eligible chunks and compute file header
         // -----------------------------------------------------------------------
         if let Some(bytes) = &graphic_bytes {
             chunks.push((b"UIGR", bytes));
@@ -589,32 +675,70 @@ impl VatfBuilder {
         if let Some(bytes) = &button_bytes {
             chunks.push((b"UIBT", bytes));
         }
-        let payload_size: u32 = chunks
-            .iter()
-            .map(|(_, data)| data.len() as u32 + CHUNK_HEADER_SIZE as u32)
-            .sum();
 
+        let mut encoded_chunks: Vec<([u8; 4], u8, u32, Vec<u8>)> = Vec::with_capacity(chunks.len());
+        let mut payload_size: usize = 0;
+        for (four_cc, raw) in chunks {
+            let uncompressed_len =
+                u32::try_from(raw.len()).context("chunk uncompressed length exceeds u32")?;
+            let (codec, stored) = compress_chunk(four_cc, raw, compression_mode)?;
+            let _ = u32::try_from(stored.len()).context("chunk compressed length exceeds u32")?;
+            payload_size = payload_size
+                .checked_add(CHUNK_HEADER_SIZE)
+                .and_then(|s| s.checked_add(stored.len()))
+                .context("VAB payload size overflow")?;
+            encoded_chunks.push((*four_cc, codec, uncompressed_len, stored));
+        }
+
+        let total_length = MAGIC_BYTES
+            .len()
+            .checked_add(mem::size_of::<Header>())
+            .and_then(|s| s.checked_add(payload_size))
+            .context("VAB total length overflow")?;
         let file_header = Header {
             version: VAB_VERSION,
-            length: MAGIC_BYTES.len() as u32 + mem::size_of::<Header>() as u32 + payload_size,
+            length: u32::try_from(total_length).context("VAB file exceeds u32 length")?,
         };
 
         // -----------------------------------------------------------------------
         // 3. Assemble and write payload
         // -----------------------------------------------------------------------
-        let mut raw_payload = Vec::with_capacity(file_header.length as usize);
+        let mut raw_payload = Vec::with_capacity(total_length);
         raw_payload.extend(MAGIC_BYTES);
         raw_payload.extend(bytemuck::bytes_of(&file_header));
-        for (four_cc, data) in &chunks {
+        for (four_cc, codec, uncompressed_length, stored) in &encoded_chunks {
             let chunk_header = ChunkHeader {
-                chunk_type: **four_cc,
-                length: data.len() as u32,
+                chunk_type: *four_cc,
+                length: stored.len() as u32,
+                uncompressed_length: *uncompressed_length,
+                compression: *codec,
+                _reserved: [0; 3],
             };
             raw_payload.extend(bytemuck::bytes_of(&chunk_header));
-            raw_payload.extend(*data);
+            raw_payload.extend(stored);
         }
 
         Ok((raw_payload, report))
+    }
+}
+
+fn compress_chunk(four_cc: &[u8; 4], raw: &[u8], mode: VabCompression) -> Result<(u8, Vec<u8>)> {
+    if raw.is_empty() || four_cc == b"TEXT" || mode == VabCompression::None {
+        return Ok((compression::NONE, raw.to_vec()));
+    }
+    let (codec, compressed) = match mode {
+        VabCompression::None => unreachable!(),
+        VabCompression::Lz4 => (compression::LZ4, lz4_flex::block::compress(raw)),
+        VabCompression::Deflate => {
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(raw)?;
+            (compression::DEFLATE, encoder.finish()?)
+        }
+    };
+    if compressed.len() < raw.len() {
+        Ok((codec, compressed))
+    } else {
+        Ok((compression::NONE, raw.to_vec()))
     }
 }
 
@@ -681,6 +805,11 @@ fn build_builder_reader(
     } else {
         swf.tags
     };
+    let reachable_shapes = if ui_sources.is_none() {
+        Some(collect_reachable_characters(&tags))
+    } else {
+        None
+    };
     parse_tags(
         tags,
         &mut builder,
@@ -688,6 +817,7 @@ fn build_builder_reader(
         0,
         &mut bitmap,
         &mut jpeg_tables,
+        reachable_shapes.as_ref(),
     )?;
 
     builder.animations = animations;
@@ -740,6 +870,53 @@ pub fn convert_swf_to_vab_with_report(
 // SWF tag processing
 // ===========================================================================
 
+/// Collect character IDs transitively referenced from the root timeline so
+/// ordinary animations skip tessellating completely unplaced `DefineShape`s.
+fn collect_reachable_characters(tags: &[Tag<'_>]) -> HashSet<CharacterId> {
+    let mut children: HashMap<CharacterId, Vec<CharacterId>> = HashMap::new();
+    let mut root_refs = Vec::new();
+    for tag in tags {
+        match tag {
+            Tag::PlaceObject(place) => match place.action {
+                swf::PlaceObjectAction::Place(id) | swf::PlaceObjectAction::Replace(id) => {
+                    root_refs.push(id);
+                }
+                swf::PlaceObjectAction::Modify => {}
+            },
+            Tag::DefineSprite(sprite) => {
+                let entry = children.entry(sprite.id).or_default();
+                for sub in &sprite.tags {
+                    if let Tag::PlaceObject(place) = sub {
+                        match place.action {
+                            swf::PlaceObjectAction::Place(id)
+                            | swf::PlaceObjectAction::Replace(id) => entry.push(id),
+                            swf::PlaceObjectAction::Modify => {}
+                        }
+                    }
+                }
+            }
+            Tag::DefineButton(button) | Tag::DefineButton2(button) => {
+                let entry = children.entry(button.id).or_default();
+                for record in &button.records {
+                    entry.push(record.id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut reachable = HashSet::new();
+    let mut stack = root_refs;
+    while let Some(id) = stack.pop() {
+        if reachable.insert(id)
+            && let Some(refs) = children.get(&id)
+        {
+            stack.extend(refs.iter().copied());
+        }
+    }
+    reachable
+}
+
 /// Recursively process SWF tags, collecting geometry into `builder` and
 /// frame timelines into `animations`.
 fn parse_tags(
@@ -749,6 +926,7 @@ fn parse_tags(
     sprite_id: CharacterId,
     bitmap: &mut HashMap<CharacterId, CompressedBitmap>,
     jpeg_tables: &mut Option<Vec<u8>>,
+    reachable_shapes: Option<&HashSet<CharacterId>>,
 ) -> Result<()> {
     // BTreeMap used during frame construction for sorted insert/lookup/remove
     // by depth. Cloned into a Vec at each ShowFrame — depth ordering is preserved.
@@ -760,7 +938,9 @@ fn parse_tags(
     for tag in tags {
         match tag {
             Tag::DefineShape(shape) => {
-                builder.process_swf_shape(&shape, bitmap);
+                if reachable_shapes.is_none_or(|set| set.contains(&shape.id)) {
+                    builder.process_swf_shape(&shape, bitmap);
+                }
             }
             Tag::DefineMorphShape(morph_data) => {
                 builder.morph_shapes.insert(morph_data.id, *morph_data);
@@ -818,6 +998,7 @@ fn parse_tags(
                     sprite.id,
                     bitmap,
                     jpeg_tables,
+                    reachable_shapes,
                 )?;
             }
 

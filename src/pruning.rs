@@ -1,9 +1,10 @@
 //! Compact serialized resources from final baked references, never visibility guesses.
 use crate::{
-    GradientUniforms, MorphEntry, ShapeMesh, ShapeRecord, VatfBuilder, Vertex,
+    GradientUniforms, MorphEntry, NO_TEXTURE, ShapeMesh, ShapeRecord, TextureRecord, VatfBuilder,
+    Vertex,
     baked::{BakedMovie, BakedNode},
     graphics::Graphic,
-    material,
+    index_format, material,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -77,6 +78,35 @@ mod tests {
         builder.gradient_uniforms = vec![GradientUniforms::default(); 3];
         builder.bitmap_uniforms = vec![[0.0; 6]; 2];
         builder.texture = (0..12).collect();
+        builder.texture_records = vec![
+            TextureRecord {
+                offset: 0,
+                length: 4,
+                width: 1,
+                height: 1,
+                encoding: crate::texture_encoding::WEBP,
+                _pad: [0; 3],
+            },
+            TextureRecord {
+                offset: 4,
+                length: 4,
+                width: 2,
+                height: 1,
+                encoding: crate::texture_encoding::WEBP,
+                _pad: [0; 3],
+            },
+            TextureRecord {
+                offset: 8,
+                length: 4,
+                width: 1,
+                height: 2,
+                encoding: crate::texture_encoding::WEBP,
+                _pad: [0; 3],
+            },
+        ];
+        for mesh in &mut builder.shape_meshes {
+            mesh.texture_index = NO_TEXTURE;
+        }
         for (index, kind, material) in [
             (1, material::GRADIENT, 2),
             (2, material::BITMAP, 1),
@@ -85,8 +115,7 @@ mod tests {
             let mesh = &mut builder.shape_meshes[index];
             mesh.material_type = kind;
             mesh.material_offset = material;
-            mesh.texture_offset = 4;
-            mesh.texture_length = 4;
+            mesh.texture_index = 1;
         }
         builder.morph_entries = [(1000, 7), (2000, 8)]
             .into_iter()
@@ -151,13 +180,18 @@ mod tests {
         assert_eq!((report.before.meshes, report.after.meshes), (9, 6));
         assert_eq!((resources.shapes.len(), resources.morphs.len()), (4, 1));
         assert_eq!((resources.gradients.len(), resources.bitmaps.len()), (1, 1));
+        assert_eq!(resources.textures.len(), 1);
+        assert_eq!(resources.textures[0].offset, 0);
+        assert_eq!(resources.textures[0].length, 4);
         assert_eq!(resources.texture, [4, 5, 6, 7]);
         assert!(report.after.bytes < report.before.bytes);
+        assert!(resources.indices_u32.is_empty());
         for (new, old) in [1, 2, 4, 5, 6, 7].into_iter().enumerate() {
             let mesh = resources.meshes[new];
             assert_eq!(mesh.vertex_offset, new as u32 * 3);
+            assert_eq!(mesh.index_format, index_format::U16);
             assert_eq!(resources.vertices[new * 3].x, old);
-            assert_eq!(&resources.indices[new * 3..new * 3 + 3], &[0, 1, 2]);
+            assert_eq!(&resources.indices_u16[new * 3..new * 3 + 3], &[0u16, 1, 2]);
         }
         assert_eq!(
             resources
@@ -171,8 +205,9 @@ mod tests {
         assert_eq!(resources.morphs[0].index_offset, 15);
         assert_eq!(resources.meshes[0].material_offset, 0);
         assert_eq!(resources.meshes[1].material_offset, 0);
-        assert_eq!(resources.meshes[0].texture_offset, 0);
-        assert_eq!(resources.meshes[1].texture_offset, 0);
+        assert_eq!(resources.meshes[0].texture_index, 0);
+        assert_eq!(resources.meshes[1].texture_index, 0);
+        assert_eq!(resources.meshes[2].texture_index, NO_TEXTURE);
         // Compaction is repeatable and leaves compiler-side source offsets untouched.
         let (_, again) = Resources::compact(&builder, &baked, &[]).unwrap();
         assert_eq!(report, again);
@@ -239,9 +274,11 @@ pub(crate) struct Resources {
     pub meshes: Vec<ShapeMesh>,
     pub gradients: Vec<GradientUniforms>,
     pub bitmaps: Vec<[f32; 6]>,
+    pub textures: Vec<TextureRecord>,
     pub texture: Vec<u8>,
     pub vertices: Vec<Vertex>,
-    pub indices: Vec<u32>,
+    pub indices_u32: Vec<u32>,
+    pub indices_u16: Vec<u16>,
     pub morphs: Vec<MorphEntry>,
 }
 
@@ -251,9 +288,11 @@ fn count(
     meshes: usize,
     gradients: usize,
     bitmaps: usize,
+    texture_records: usize,
     texture: usize,
     vertices: usize,
-    indices: usize,
+    indices_u32: usize,
+    indices_u16: usize,
     morphs: usize,
 ) -> ResourceCounts {
     ResourceCounts {
@@ -263,15 +302,17 @@ fn count(
         bitmap_materials: bitmaps,
         texture_bytes: texture,
         vertices,
-        indices,
+        indices: indices_u32 + indices_u16,
         morph_entries: morphs,
         bytes: shapes * size_of::<ShapeRecord>()
             + meshes * size_of::<ShapeMesh>()
             + gradients * size_of::<GradientUniforms>()
             + bitmaps * size_of::<[f32; 6]>()
+            + texture_records * size_of::<TextureRecord>()
             + texture
             + vertices * size_of::<Vertex>()
-            + indices * size_of::<u32>()
+            + indices_u32 * size_of::<u32>()
+            + indices_u16 * size_of::<u16>()
             + morphs * size_of::<MorphEntry>(),
     }
 }
@@ -426,11 +467,24 @@ impl Resources {
                 "{label}: index exceeds vertex count"
             );
             mesh.vertex_offset = offset(result.vertices.len())?;
-            mesh.index_offset = offset(result.indices.len())?;
             result.vertices.extend_from_slice(vertices);
-            result.indices.extend_from_slice(indices); // Indices are mesh-local, not global.
+            // Indices are mesh-local, not global. Pack into u16 whenever every
+            // vertex index fits losslessly in u16 (which holds for almost every SWF shape).
+            if mesh.vertex_count <= u16::MAX as u32 {
+                mesh.index_format = index_format::U16;
+                mesh.index_offset = offset(result.indices_u16.len())?;
+                result
+                    .indices_u16
+                    .extend(indices.iter().map(|&index| index as u16));
+            } else {
+                mesh.index_format = index_format::U32;
+                mesh.index_offset = offset(result.indices_u32.len())?;
+                result.indices_u32.extend_from_slice(indices);
+            }
             match mesh.material_type {
-                material::COLOR => {}
+                material::COLOR => {
+                    mesh.texture_index = NO_TEXTURE;
+                }
                 material::GRADIENT => {
                     mesh.material_offset = remap_material(
                         &builder.gradient_uniforms,
@@ -452,15 +506,24 @@ impl Resources {
                 value => anyhow::bail!("{label}: unknown material type {value}"),
             }
             if mesh.material_type != material::COLOR {
-                let key = (mesh.texture_offset, mesh.texture_length);
-                mesh.texture_offset = if let Some(new) = texture_map.get(&key) {
-                    *new
-                } else {
-                    let bytes = range(&builder.texture, key.0, key.1, &label)?;
-                    let new = offset(result.texture.len())?;
-                    result.texture.extend_from_slice(bytes);
-                    texture_map.insert(key, new);
+                let old_tex = mesh.texture_index;
+                mesh.texture_index = if let Some(&new) = texture_map.get(&old_tex) {
                     new
+                } else {
+                    let record = builder
+                        .texture_records
+                        .get(old_tex as usize)
+                        .with_context(|| format!("{label}: missing texture record {old_tex}"))?;
+                    let bytes = range(&builder.texture, record.offset, record.length, &label)?;
+                    let new_offset = offset(result.texture.len())?;
+                    result.texture.extend_from_slice(bytes);
+                    let new_index = offset(result.textures.len())?;
+                    result.textures.push(TextureRecord {
+                        offset: new_offset,
+                        ..*record
+                    });
+                    texture_map.insert(old_tex, new_index);
+                    new_index
                 };
             }
             mesh_map[*old] = Some(offset(result.meshes.len())?);
@@ -497,9 +560,11 @@ impl Resources {
                 builder.shape_meshes.len(),
                 builder.gradient_uniforms.len(),
                 builder.bitmap_uniforms.len(),
+                builder.texture_records.len(),
                 builder.texture.len(),
                 builder.vertices.len(),
                 builder.indices.len(),
+                0,
                 builder.morph_entries.len(),
             ),
             after: count(
@@ -507,9 +572,11 @@ impl Resources {
                 result.meshes.len(),
                 result.gradients.len(),
                 result.bitmaps.len(),
+                result.textures.len(),
                 result.texture.len(),
                 result.vertices.len(),
-                result.indices.len(),
+                result.indices_u32.len(),
+                result.indices_u16.len(),
                 result.morphs.len(),
             ),
         };

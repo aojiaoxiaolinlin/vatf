@@ -1,13 +1,19 @@
 use std::collections::HashMap;
+use std::io::Read;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use bincode::Options;
 use bytemuck;
+use flate2::read::DeflateDecoder;
 
 use crate::{
     CHUNK_HEADER_SIZE, ChunkHeader, GradientUniforms, Header, MAGIC_BYTES, MorphEntry, ShapeMesh,
-    ShapeRecord, VAB_VERSION, Vertex,
+    ShapeRecord, TextureRecord, VAB_VERSION, Vertex, compression,
 };
+
+/// Upper bound on any single decompressed chunk payload (256 MiB) to guard
+/// against corrupted headers or decompression bombs.
+const MAX_CHUNK_UNCOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
 /// A chunk payload stored in an 8-byte aligned buffer.
 ///
@@ -23,20 +29,91 @@ struct AlignedChunk {
 }
 
 impl AlignedChunk {
-    fn from_bytes(data: &[u8]) -> Self {
-        let word_count = data.len().div_ceil(size_of::<u64>());
-        let mut words = vec![0u64; word_count];
-        let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut words);
-        bytes[..data.len()].copy_from_slice(data);
+    fn new_zeroed(length: usize) -> Self {
+        let word_count = length.div_ceil(size_of::<u64>());
         Self {
-            words,
-            length: data.len(),
+            words: vec![0u64; word_count],
+            length,
         }
+    }
+
+    fn from_bytes(data: &[u8]) -> Self {
+        let mut chunk = Self::new_zeroed(data.len());
+        chunk.as_bytes_mut().copy_from_slice(data);
+        chunk
     }
 
     fn as_bytes(&self) -> &[u8] {
         let bytes: &[u8] = bytemuck::cast_slice(&self.words);
         &bytes[..self.length]
+    }
+
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut self.words);
+        &mut bytes[..self.length]
+    }
+}
+
+fn decode_chunk(header: &ChunkHeader, raw: &[u8]) -> Result<AlignedChunk> {
+    ensure!(
+        header._reserved == [0; 3],
+        "Non-zero reserved bytes in chunk {:?}",
+        header.chunk_type
+    );
+    let expected_len = header.uncompressed_length as usize;
+    ensure!(
+        expected_len <= MAX_CHUNK_UNCOMPRESSED_BYTES,
+        "Chunk {:?} uncompressed size {} exceeds limit {}",
+        header.chunk_type,
+        expected_len,
+        MAX_CHUNK_UNCOMPRESSED_BYTES
+    );
+
+    match header.compression {
+        compression::NONE => {
+            ensure!(
+                raw.len() == expected_len,
+                "Uncompressed chunk {:?} length mismatch: stored {} B vs uncompressed {} B",
+                header.chunk_type,
+                raw.len(),
+                expected_len
+            );
+            Ok(AlignedChunk::from_bytes(raw))
+        }
+        compression::LZ4 => {
+            let mut out = AlignedChunk::new_zeroed(expected_len);
+            let written =
+                lz4_flex::block::decompress_into(raw, out.as_bytes_mut()).map_err(|e| {
+                    anyhow::anyhow!("LZ4 decode failed for chunk {:?}: {e}", header.chunk_type)
+                })?;
+            ensure!(
+                written == expected_len,
+                "LZ4 chunk {:?} decoded {} B, expected {} B",
+                header.chunk_type,
+                written,
+                expected_len
+            );
+            Ok(out)
+        }
+        compression::DEFLATE => {
+            let mut out = AlignedChunk::new_zeroed(expected_len);
+            let mut decoder = DeflateDecoder::new(raw);
+            decoder.read_exact(out.as_bytes_mut()).with_context(|| {
+                format!("DEFLATE decode failed for chunk {:?}", header.chunk_type)
+            })?;
+            let mut extra = [0u8; 1];
+            ensure!(
+                decoder.read(&mut extra)? == 0,
+                "DEFLATE chunk {:?} has trailing uncompressed bytes past {}",
+                header.chunk_type,
+                expected_len
+            );
+            Ok(out)
+        }
+        codec => bail!(
+            "Unsupported compression codec {codec} in chunk {:?}",
+            header.chunk_type
+        ),
     }
 }
 
@@ -125,19 +202,15 @@ impl VabReader {
             }
             chunks.insert(
                 chunk_header.chunk_type,
-                AlignedChunk::from_bytes(&chunk_data[offset..data_end]),
+                decode_chunk(&chunk_header, &chunk_data[offset..data_end])?,
             );
             offset = data_end;
         }
 
         // ── Deserialize baked animation data ──────────────────────────────
         let baked_data = chunks.get(b"BAKD").context("VAB missing BAKD chunk")?;
-        let baked: crate::baked::BakedMovie = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_limit(bytes.len() as u64)
-            .reject_trailing_bytes()
-            .deserialize(baked_data.as_bytes())
-            .context("Corrupt BAKD chunk")?;
+        let baked =
+            crate::compact::decode_movie(baked_data.as_bytes()).context("Corrupt BAKD chunk")?;
         baked.validate()?;
         Ok(Self {
             baked,
@@ -210,8 +283,13 @@ impl VabReader {
         self.chunk_data(b"BMAP").and_then(Self::cast_pod_slice)
     }
 
-    /// Raw texture bytes (interleaved — WebP for gradients, bitmaps).
-    /// Use `texture_offset` / `texture_length` from `ShapeMesh` to locate individual textures:
+    /// Texture metadata records indexed by `ShapeMesh::texture_index`.
+    pub fn texture_records(&self) -> Option<&[TextureRecord]> {
+        self.chunk_data(b"TEXD").and_then(Self::cast_pod_slice)
+    }
+
+    /// Raw texture bytes (WebP or raw RGBA8).
+    /// Use `TextureRecord::offset` / `TextureRecord::length` via `texture_records()` to locate individual textures.
     pub fn texture_data(&self) -> Option<&[u8]> {
         self.chunk_data(b"TEXT")
     }
@@ -221,9 +299,14 @@ impl VabReader {
         self.chunk_data(b"VERT").and_then(Self::cast_pod_slice)
     }
 
-    /// Triangle indices (u32 triplets).
+    /// 32-bit triangle indices (for meshes with `index_format == index_format::U32`).
     pub fn indices(&self) -> Option<&[u32]> {
         self.chunk_data(b"INDX").and_then(Self::cast_pod_slice)
+    }
+
+    /// 16-bit triangle indices (for meshes with `index_format == index_format::U16`).
+    pub fn indices_u16(&self) -> Option<&[u16]> {
+        self.chunk_data(b"IND2").and_then(Self::cast_pod_slice)
     }
 
     /// Frame rate of the source SWF (frames per second).
@@ -292,12 +375,7 @@ impl VabReader {
         let Some(data) = self.chunk_data(b"UIGR") else {
             return Ok(Vec::new());
         };
-        let graphics: Vec<crate::graphics::Graphic> = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .with_limit(data.len() as u64)
-            .reject_trailing_bytes()
-            .deserialize(data)
-            .context("Corrupt UIGR chunk")?;
+        let graphics = crate::compact::decode_graphics(data).context("Corrupt UIGR chunk")?;
         let mut names = std::collections::HashSet::new();
         for graphic in &graphics {
             crate::graphics::validate_name(&graphic.name)?;
@@ -360,9 +438,11 @@ mod tests {
         assert!(reader.has_chunk(b"SHME"));
         assert!(reader.has_chunk(b"GRAD"));
         assert!(reader.has_chunk(b"BMAP"));
+        assert!(reader.has_chunk(b"TEXD"));
         assert!(reader.has_chunk(b"TEXT"));
         assert!(reader.has_chunk(b"VERT"));
         assert!(reader.has_chunk(b"INDX"));
+        assert!(reader.has_chunk(b"IND2"));
         assert!(reader.has_chunk(b"MORP"));
         // The ANIM chunk was removed from the format; BAKD is the only
         // animation carrier now.
@@ -373,9 +453,11 @@ mod tests {
         assert_eq!(reader.shape_meshes().unwrap().len(), 0);
         assert_eq!(reader.gradient_uniforms().unwrap().len(), 0);
         assert_eq!(reader.bitmap_uniforms().unwrap().len(), 0);
+        assert_eq!(reader.texture_records().unwrap().len(), 0);
         assert_eq!(reader.texture_data().unwrap().len(), 0);
         assert_eq!(reader.vertices().unwrap().len(), 0);
         assert_eq!(reader.indices().unwrap().len(), 0);
+        assert_eq!(reader.indices_u16().unwrap().len(), 0);
 
         // An empty builder produces an empty movie.
         assert!(reader.baked().clips.is_empty());
@@ -404,8 +486,9 @@ mod tests {
             index_offset: 0,
             material_type: 0,
             sampler_flags: 0,
-            texture_offset: 0,
-            texture_length: 0,
+            texture_index: crate::NO_TEXTURE,
+            index_format: crate::index_format::U32,
+            _pad: 0,
             material_offset: 0,
             bounds_half_x: 50.0,
             bounds_half_y: 50.0,
@@ -482,13 +565,15 @@ mod tests {
         let meshes = reader.shape_meshes().unwrap();
         assert_eq!(meshes.len(), 1);
         assert_eq!(meshes[0].vertex_count, 3);
+        assert_eq!(meshes[0].index_format, crate::index_format::U16);
+        assert_eq!(meshes[0].texture_index, crate::NO_TEXTURE);
 
         let verts = reader.vertices().unwrap();
         assert_eq!(verts.len(), 3);
         assert_eq!(verts[0].x, 0);
 
-        let indices = reader.indices().unwrap();
-        assert_eq!(indices, &[0u32, 1, 2]);
+        assert!(reader.indices().unwrap().is_empty());
+        assert_eq!(reader.indices_u16().unwrap(), &[0u16, 1, 2]);
 
         // The `anim_start` label produced a clip named "start".
         let movie = reader.baked();
@@ -543,5 +628,99 @@ mod tests {
             }
             Ok(_) => panic!("Expected error for invalid magic"),
         }
+    }
+
+    #[test]
+    fn compression_modes_round_trip_identically_and_reject_corrupt_streams() {
+        use crate::{VabCompression, matrix::Matrix, transform::Transform};
+        use swf::ColorTransform;
+
+        let mut builder = VatfBuilder::default();
+        builder.shape_records.push(ShapeRecord {
+            id: 1,
+            sub_shape_count: 1,
+            sub_shape_offset: 0,
+        });
+        // Add enough repetitive vertices so LZ4 & Deflate actually compress VERT/IND2.
+        for i in 0..300u32 {
+            builder.vertices.push(Vertex {
+                x: (i % 10) as i16,
+                y: (i % 7) as i16,
+                color: crate::Color {
+                    r: 200,
+                    g: 100,
+                    b: 50,
+                    a: 255,
+                },
+            });
+            builder.indices.push(i % 300);
+        }
+        builder.shape_meshes.push(ShapeMesh {
+            vertex_count: 300,
+            vertex_offset: 0,
+            index_count: 300,
+            index_offset: 0,
+            material_type: crate::material::COLOR,
+            sampler_flags: 0,
+            texture_index: crate::NO_TEXTURE,
+            index_format: crate::index_format::U32,
+            _pad: 0,
+            material_offset: 0,
+            bounds_half_x: 10.0,
+            bounds_half_y: 10.0,
+            bounds_center_x: 0.0,
+            bounds_center_y: 0.0,
+        });
+        let frames = vec![
+            vec![DisplayObject {
+                id: 1,
+                name: None,
+                depth: 1,
+                clip_depth: 0,
+                blend_mode: swf::BlendMode::Normal,
+                transform: Transform {
+                    matrix: Matrix::IDENTITY,
+                    color_transform: ColorTransform::IDENTITY,
+                },
+                filters: Box::new([]),
+                ratio: 0,
+                place_frame: 0,
+            }];
+            20
+        ];
+        builder.animations.insert(0, frames);
+        builder.frame_rate = 24.0;
+
+        let (raw_bytes, _) = builder
+            .to_vab_bytes_with_compression(VabCompression::None)
+            .unwrap();
+        let (lz4_bytes, _) = builder
+            .to_vab_bytes_with_compression(VabCompression::Lz4)
+            .unwrap();
+        let (deflate_bytes, _) = builder
+            .to_vab_bytes_with_compression(VabCompression::Deflate)
+            .unwrap();
+
+        assert!(lz4_bytes.len() < raw_bytes.len());
+        assert!(deflate_bytes.len() < raw_bytes.len());
+
+        let r_none = VabReader::from_bytes(&raw_bytes).unwrap();
+        let r_lz4 = VabReader::from_bytes(&lz4_bytes).unwrap();
+        let r_deflate = VabReader::from_bytes(&deflate_bytes).unwrap();
+
+        for reader in [&r_lz4, &r_deflate] {
+            assert_eq!(
+                crate::compact::encode_movie(reader.baked()),
+                crate::compact::encode_movie(r_none.baked())
+            );
+            assert_eq!(reader.vertices().unwrap().len(), 300);
+            assert_eq!(reader.indices_u16().unwrap(), r_none.indices_u16().unwrap());
+        }
+
+        // Flipping a byte inside a compressed DEFLATE chunk must fail cleanly.
+        let mut corrupt = deflate_bytes.clone();
+        let tail = corrupt.len() - 4;
+        corrupt[tail] ^= 0xFF;
+        assert!(VabReader::from_bytes(&corrupt).is_err());
     }
 }

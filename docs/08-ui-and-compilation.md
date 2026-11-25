@@ -7,9 +7,11 @@
 ```rust
 pub enum SwfCompileMode { Animation, StaticUi, AnimatedUi }
 pub enum RootTranslationPolicy { Preserve, NormalizeClipStart }
+pub enum VabCompression { None, Lz4, Deflate } // 默认 Deflate
 pub struct SwfCompileSettings {
     pub mode: SwfCompileMode,
     pub root_translation: RootTranslationPolicy,
+    pub compression: VabCompression,
 }
 pub struct CompiledVab {
     pub bytes: Vec<u8>,
@@ -17,7 +19,7 @@ pub struct CompiledVab {
 }
 ```
 
-`SwfCompileSettings::default()` 选择 Animation + Preserve。设置支持 serde，未知字段会报错。`compile_swf(&[u8], &settings)` 不读写文件；`convert_swf(&Path, &Path, &settings)` 创建输出父目录并写入文件，返回裁剪报告。CLI 和 Bevy 处理器使用相同入口。
+`SwfCompileSettings::default()` 选择 Animation + Preserve + Deflate（CLI 可通过 `--compression <deflate|lz4|none>` 指定）。设置支持 serde，旧元数据缺失新字段时会回退默认值，未知字段会报错。`compile_swf(&[u8], &settings)` 不读写文件；`convert_swf(&Path, &Path, &settings)` 创建输出父目录并写入文件，返回裁剪报告。CLI 和 Bevy 处理器使用相同入口。
 
 普通动画保留根动作与事件、预展开普通 Sprite、共享命名皮肤变体。UI 模式使用 ExportAssets 导出库，源根舞台不是 UI 资产自身的显示内容。
 
@@ -66,7 +68,7 @@ hit 不绘制为按钮状态，也不表示 focus。配套 Bevy 插件使用原�
 
 ## 二进制扩展与读取
 
-VAB 基础 chunk 包含 BAKD 和几何/材质/纹理资源；UI 增加可选的 bincode 编码 UIGR（图形帧）与 UIBT（按钮状态引用）。普通动画不需要这些 UI chunk。
+VAB v2 基础 chunk 包含 `BAKD`（紧凑无损编码）和几何/`TEXD`/`TEXT`/材质等资源（支持 `NONE`/`LZ4`/`DEFLATE` 按块无损压缩，`TEXT` 跳过再压缩）；UI 增加紧凑二进制编码的 `UIGR`（图形帧）与 `bincode` 编码的 `UIBT`（按钮状态引用）。普通动画不需要这些 UI chunk。
 
 ```rust,no_run
 # fn main() -> anyhow::Result<()> {
@@ -77,16 +79,16 @@ let buttons = reader.buttons()?;
 # }
 ```
 
-不存在的可选 chunk 返回空 Vec；存在但损坏或不符合契约会返回错误。bincode 依赖双方一致的数据 schema，并非自描述、跨任意版本兼容的格式。
+不存在的可选 chunk 返回空 Vec；存在但损坏或不符合契约会返回错误。`UIBT` 的 `bincode` 以及 `BAKD`/`UIGR` 编解码器均要求读写端 schema 与 `VAB_VERSION` 匹配。
 
 ## 两阶段资源裁剪
 
-1. UI 解析 ExportAssets 的依赖闭包，只为需要的源定义构建图形，减少无关定义的三角化开销。
-2. 写 VAB 前，从最终 BAKD、所有 UI 帧与按钮状态的引用出发压缩资源。
+1. UI 解析 ExportAssets 的依赖闭包，只为需要的源定义构建图形，减少无关定义的三角化开销；普通动画也会在曲面细分前先按根时间轴可达性跳过完全未放置的 `DefineShape`。
+2. 写 VAB 前，从最终 `BAKD`、所有 UI 帧与按钮状态的引用出发压缩资源。
 
 普通动画的所有动作、所有皮肤变体、所有帧，UI 的所有导出、按钮 hit、遮罩和分组内部节点都属于保留根。不会依据当前皮肤、alpha=0 或相机可见性删资源。
 
-压缩重新排列 mesh、VERT、INDX、GRAD、BMAP、TEXT 和 morph 几何偏移，同时更新相关查找区间；Character ID 与烘焙节点引用不变。一个依赖被多个导出共享时不会重复复制。报告的 before/after 包含资源计数与逻辑资源载荷字节，不包含整个文件的 chunk 头和全部烘焙树体积；源侧提前剔除的定义也不等于报告里最终压缩的差值。
+压缩重新排列 mesh、`VERT`、`INDX`/`IND2`（顶点数 ≤ 65535 自动转为 `u16` 索引）、`GRAD`、`BMAP`、`TEXD`/`TEXT` 和 morph 几何偏移，同时更新相关查找区间；Character ID 与烘焙节点引用不变。一个依赖被多个导出共享时不会重复复制。报告的 before/after 包含资源计数与逻辑资源载荷字节，不包含整个文件的 chunk 头和全部烘焙树体积；源侧提前剔除的定义也不等于报告里最终压缩的差值。
 
 ## Bevy 预处理与发布
 
@@ -94,7 +96,7 @@ let buttons = reader.buttons()?;
 
 处理器把源 SWF 转成 VAB bytes，同时生成 VabLoader 元数据。它不修改逻辑资产路径，所以 UI 子资产仍通过 `.swf#export` 加载。正式应用可以不编译处理器 feature，只分发已处理字节和元数据。
 
-Bevy 的源内容/元数据哈希不能感知编译器代码变化。`COMPILER_REVISION` 在编译行为变化时递增，配套 `vab_processed_asset_path` 为缓存路径加修订命名空间。VAB_VERSION 则是文件格式版本，当前未发布工作版本为 1；开发阶段原地改 schema 后仍须重编译全部产物。两者职责不同。
+Bevy 的源内容/元数据哈希不能感知编译器代码变化。`COMPILER_REVISION`（当前为 `3`）在编译行为变化时递增，配套 `vab_processed_asset_path` 为缓存路径加修订命名空间。`VAB_VERSION` 则是文件格式版本（当前为 `2`）；两者职责不同。
 
 ## 根平移策略更新（2026-10-07）
 
@@ -102,4 +104,4 @@ Bevy 的源内容/元数据哈希不能感知编译器代码变化。`COMPILER_R
 仅适用于显式选择 `NormalizeClipStart` 的动作素材表；CLI 使用
 `--normalize-clip-start`，共享 `SwfCompileSettings` 使用 `root_translation` 字段。
 设置缺省字段兼容旧元数据，但缺省语义现在为保留。UI 导出和无标签场景不受影响。
-编译器修订号更新为 2，VAB 格式版本仍为 1。
+（该策略自 `COMPILER_REVISION = 2` 引入；随 VAB v2 压缩与前序裁剪扩展，当前 `COMPILER_REVISION = 3`、`VAB_VERSION = 2`。）

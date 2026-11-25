@@ -1,9 +1,29 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
-use vatf::{RootTranslationPolicy, SwfCompileMode, SwfCompileSettings, convert_swf};
+use vatf::{
+    RootTranslationPolicy, SwfCompileMode, SwfCompileSettings, VabCompression, convert_swf,
+};
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum CompressionArg {
+    None,
+    Lz4,
+    #[default]
+    Deflate,
+}
+
+impl From<CompressionArg> for VabCompression {
+    fn from(value: CompressionArg) -> Self {
+        match value {
+            CompressionArg::None => VabCompression::None,
+            CompressionArg::Lz4 => VabCompression::Lz4,
+            CompressionArg::Deflate => VabCompression::Deflate,
+        }
+    }
+}
 
 /// SWF → VAB converter — bake Flash animations into a compact runtime format.
 #[derive(Parser)]
@@ -22,6 +42,10 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["ui", "ui_animated"])]
     normalize_clip_start: bool,
 
+    /// Chunk compression codec (defaults to deflate).
+    #[arg(long, value_enum, default_value_t = CompressionArg::Deflate)]
+    compression: CompressionArg,
+
     /// Output path.
     ///
     /// For a single file: full output path (including .vab extension).
@@ -32,24 +56,18 @@ struct Cli {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+    let compile_settings = settings(
+        args.ui,
+        args.ui_animated,
+        args.normalize_clip_start,
+        args.compression.into(),
+    );
 
     if args.input.is_dir() {
-        convert_dir(
-            &args.input,
-            args.output.as_deref(),
-            args.ui,
-            args.ui_animated,
-            args.normalize_clip_start,
-        )?;
+        convert_dir(&args.input, args.output.as_deref(), &compile_settings)?;
     } else {
         let output = resolve_output(&args.input, args.output.as_deref());
-        convert_single(
-            &args.input,
-            &output,
-            args.ui,
-            args.ui_animated,
-            args.normalize_clip_start,
-        )?;
+        convert_single(&args.input, &output, &compile_settings)?;
     }
 
     Ok(())
@@ -60,19 +78,13 @@ fn main() -> Result<()> {
 fn convert_single(
     input: &std::path::Path,
     output: &std::path::Path,
-    ui: bool,
-    ui_animated: bool,
-    normalize_clip_start: bool,
+    compile_settings: &SwfCompileSettings,
 ) -> Result<()> {
     print!(
         "  Converting {} … ",
         input.file_name().unwrap_or_default().to_string_lossy()
     );
-    let result = convert_swf(
-        input,
-        output,
-        &settings(ui, ui_animated, normalize_clip_start),
-    );
+    let result = convert_swf(input, output, compile_settings);
     match &result {
         Ok(report) => println!(
             "✓  ({}; meshes {}→{}, resource payload {}→{}, textures {}→{})",
@@ -94,9 +106,7 @@ fn convert_single(
 fn convert_dir(
     input_dir: &std::path::Path,
     output_dir: Option<&std::path::Path>,
-    ui: bool,
-    ui_animated: bool,
-    normalize_clip_start: bool,
+    compile_settings: &SwfCompileSettings,
 ) -> Result<()> {
     let output_dir = output_dir
         .map(|p| p.to_path_buf())
@@ -128,11 +138,7 @@ fn convert_dir(
         let output = output_dir.join(format!("{}.vab", stem.to_string_lossy()));
 
         print!("[{:>2}/{total}] {} … ", i + 1, stem.to_string_lossy());
-        match convert_swf(
-            input,
-            &output,
-            &settings(ui, ui_animated, normalize_clip_start),
-        ) {
+        match convert_swf(input, &output, compile_settings) {
             Ok(report) => {
                 ok += 1;
                 println!(
@@ -197,7 +203,12 @@ fn file_size(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-fn settings(ui: bool, ui_animated: bool, normalize_clip_start: bool) -> SwfCompileSettings {
+fn settings(
+    ui: bool,
+    ui_animated: bool,
+    normalize_clip_start: bool,
+    compression: VabCompression,
+) -> SwfCompileSettings {
     SwfCompileSettings {
         root_translation: if normalize_clip_start {
             RootTranslationPolicy::NormalizeClipStart
@@ -211,5 +222,6 @@ fn settings(ui: bool, ui_animated: bool, normalize_clip_start: bool) -> SwfCompi
         } else {
             SwfCompileMode::Animation
         },
+        compression,
     }
 }

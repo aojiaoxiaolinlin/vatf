@@ -44,18 +44,20 @@ pub struct VabReader {
 
 ### 静态几何（POD 切片）
 
-| 方法 | 位置 | 元素类型 | 大小 |
+| 方法 | 说明 | 元素类型 | 大小 |
 |---|---|---|---|
-| `shape_records()` | `reader.rs:205` | `ShapeRecord` | 8 B |
-| `shape_meshes()` | `reader.rs:210` | `ShapeMesh` | 48 B |
-| `gradient_uniforms()` | `reader.rs:215` | `GradientUniforms` | 40 B |
-| `bitmap_uniforms()` | `reader.rs:220` | `[f32; 6]` | 24 B |
-| `vertices()` | `reader.rs:231` | `Vertex` | 8 B |
-| `indices()` | `reader.rs:236` | `u32` | 4 B |
-| `morph_entries()` | `reader.rs:260` | `MorphEntry` | 24 B |
-| `texture_data()` | `reader.rs:226` | `u8`（原始字节） | —— |
+| `shape_records()` | shape 查找区间 | `ShapeRecord` | 8 B |
+| `shape_meshes()` | 绘制网格元数据 | `ShapeMesh` | 48 B |
+| `gradient_uniforms()` | 渐变着色器参数 | `GradientUniforms` | 40 B |
+| `bitmap_uniforms()` | 位图仿射矩阵 | `[f32; 6]` | 24 B |
+| `texture_records()` | `TEXD` 纹理记录表 | `TextureRecord` | 16 B |
+| `vertices()` | 量化顶点 | `Vertex` | 8 B |
+| `indices()` | `INDX` 32 位索引（`index_format == U32`） | `u32` | 4 B |
+| `indices_u16()` | `IND2` 16 位索引（`index_format == U16`） | `u16` | 2 B |
+| `morph_entries()` | morph 查表条目 | `MorphEntry` | 24 B |
+| `texture_data()` | `TEXT` 原始字节 | `u8`（WebP/RGBA8 字节） | —— |
 
-字段含义见 [01-format.md](01-format.md#3-pod-结构体字段表)。
+字段含义见 [01-format.md](01-format.md#3-pod-结构体字段表)。`ShapeMesh::index_format` 决定从 `indices()`（`U32`）还是 `indices_u16()`（`U16`）切片；`ShapeMesh::texture_index` 索引 `texture_records()`（纯色为 `NO_TEXTURE`）。
 
 ---
 
@@ -122,24 +124,25 @@ impl AlignedChunk {
 
 | # | 检查 | 位置 | 失败信息 |
 |---|---|---|---|
-| 1 | 大端主机 | `reader.rs:70-72` | `"VATF POD chunks require a little-endian host"` |
-| 2 | `len >= 4 + size_of::<Header>()`（12） | `reader.rs:74-76` | `"VAB file too short"` |
-| 3 | magic == `b"VATF"` | `reader.rs:77-79` | `"Not a VAB file: bad magic bytes"` |
-| 4 | `version == VAB_VERSION` | `reader.rs:82-87` | `"Unsupported VAB version N (this build expects M)"` |
-| 5 | `header.length == bytes.len()` | `reader.rs:88-94` | `"VAB length mismatch …"` |
-| 6 | 每个 chunk 头不越界 | `reader.rs:102-104` | `"Truncated chunk header at offset …"` |
-| 7 | `offset + length` 不溢出 | `reader.rs:110-112` | `"chunk length overflow"` |
-| 8 | chunk 数据不越界 | `reader.rs:113-120` | `"Truncated chunk …"` |
-| 9 | FourCC 不重复 | `reader.rs:122-124` | `"duplicate chunk …"` |
-| 10 | **BAKD 必需** | `reader.rs:132` | `"VAB missing BAKD chunk"` |
-| 11 | BAKD bincode 解析 | `reader.rs:133-138` | `"Corrupt BAKD chunk"` |
-| 12 | **`baked.validate()`** | `reader.rs:139` | 各种不变量错误 |
+| 1 | 大端主机 | `reader.rs` | `"VATF v3 POD chunks require a little-endian host"`（历史文案沿用） |
+| 2 | `len >= 4 + size_of::<Header>()`（12） | `reader.rs` | `"VAB file too short"` |
+| 3 | magic == `b"VATF"` | `reader.rs` | `"Not a VAB file: bad magic bytes"` |
+| 4 | `version == VAB_VERSION` | `reader.rs` | `"Unsupported VAB version N (this build expects M)"` |
+| 5 | `header.length == bytes.len()` | `reader.rs` | `"VAB length mismatch …"` |
+| 6 | 每个 16B chunk 头不越界 | `reader.rs` | `"Truncated chunk header at offset …"` |
+| 7 | `offset + length` 不溢出 | `reader.rs` | `"chunk length overflow"` |
+| 8 | chunk 数据不越界 | `reader.rs` | `"Truncated chunk …"` |
+| 9 | FourCC 不重复 | `reader.rs` | `"duplicate chunk …"` |
+| 10 | `_reserved == 0`、`uncompressed_length <= 256 MiB` 及块解压校验 | `reader.rs` | `"Non-zero reserved..."` / 解压长度或尾部校验失败 |
+| 11 | **BAKD 必需** | `reader.rs` | `"VAB missing BAKD chunk"` |
+| 12 | `compact::decode_movie` 解析 | `reader.rs` | `"Corrupt BAKD chunk"` |
+| 13 | **`baked.validate()`** | `reader.rs` | 各种不变量错误 |
 
 第 1 条放在最前面是刻意的——**在碰任何字节之前**就确定字节序假设成立，避免后面所有 `pod_read_unaligned` 读到错误的值。
 
-第 4 条只拒绝版本号不匹配。当前未发布工作版本为 1，原地改变布局后的旧产物可能仍是 1，必须重新生成；不能依靠这一检查识别全部陈旧产物。见 [01 篇 §8](01-format.md#8-版本与兼容性)。
+第 4 条精确检查格式版本号 `VAB_VERSION`（当前为 `2`）：读取端只接受同版本产物并按 `ChunkHeader` 将每个 chunk 解压到 `AlignedChunk` 后供后续强校验；v1 文件会被明确拒绝，需从源 SWF 重新转换。见 [01 篇 §8](01-format.md#8-版本与兼容性)。
 
-第 12 条意味着**手工构造的 BAKD 是读不进来的**：校验器是加载器的一部分，不只是写端的自检。
+第 13 条意味着**手工构造的 BAKD 是读不进来的**：校验器是加载器的一部分，不只是写端的自检。
 
 ### 头字段用 `pod_read_unaligned` 读
 
@@ -299,12 +302,14 @@ match mesh.material_type {
     material::COLOR    => t.draw_color(&verts, &indices, transform, mesh, vertex_colors),
     material::GRADIENT => {
         let u = &gradient_uniforms[mesh.material_offset];
-        let tex = decode_webp(&texture[mesh.texture_offset..][..mesh.texture_length]);
+        let rec = &texture_records[mesh.texture_index];
+        let tex = decode_webp(&texture[rec.offset..][..rec.length]);
         t.draw_gradient(&verts, &indices, transform, u, tex);
     }
     material::BITMAP   => {
         let m = &bitmap_uniforms[mesh.material_offset];      // [f32;6]
-        let tex = decode_webp(&texture[mesh.texture_offset..][..mesh.texture_length]);
+        let rec = &texture_records[mesh.texture_index];
+        let tex = decode_webp(&texture[rec.offset..][..rec.length]);
         t.draw_bitmap(&verts, &indices, transform, m, tex, mesh.sampler_flags);
     }
 }
@@ -454,13 +459,13 @@ for ev in clip.events.iter().filter(|e| e.frame as usize == playhead) {
 打开
   VabReader::open(path)?                        // 会做全部校验 + baked.validate()
 
-取静态数据（零拷贝切片）
-  shape_records()  → id → [sub_shape_offset, +sub_shape_count)
-  shape_meshes()   → vertex/index/材质/纹理区间 + 反量化参数
-  vertices()       → i16 量化坐标 + 颜色
-  indices()        → u32 三角形
-  gradient_uniforms() / bitmap_uniforms() / texture_data()
-  morph_entries()  → 构建 morph_id → ratio → [entry] 两级 map
+取静态数据（解压并 8B 对齐后的切片）
+  shape_records()   → id → [sub_shape_offset, +sub_shape_count)
+  shape_meshes()    → vertex/index(U32/U16)/材质/texture_index 区间 + 反量化参数
+  vertices()        → i16 量化坐标 + 颜色
+  indices() / indices_u16() → u32 (`INDX`) 或 u16 (`IND2`) 三角形索引
+  gradient_uniforms() / bitmap_uniforms() / texture_records() / texture_data()
+  morph_entries()   → 构建 morph_id → ratio → [entry] 两级 map
 
 取动画
   baked()          → BakedMovie { frame_rate, clips, skins }

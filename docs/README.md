@@ -1,6 +1,6 @@
 # vatf 技术文档
 
-第一次使用请从 [项目 README](../README.md) 开始，运行命令和测试素材均可在本项目内找到。配套 Bevy 渲染器的效果展示与使用方法在 [bevy_flash_remake README](../../bevy_flash_remake/README.md)。
+第一次使用请从 [项目 README](../README.md) 开始，运行命令和测试素材均可在本项目内找到。配套 Bevy 渲染器的效果展示与使用方法在 [bevy_flash](https://github.com/aojiaoxiaolinlin/bevy_flash) README。
 
 ## 文档导航
 
@@ -36,6 +36,7 @@ SWF bytes + SwfCompileSettings
 | 文件 | 职责 |
 |---|---|
 | `src/compiler.rs` | 共用编译设置、字节编译与文件接口、COMPILER_REVISION |
+| `src/compact.rs` | `BAKD`/`UIGR` 无损紧凑二进制编解码（帧去重、位掩码省略、varint） |
 | `src/main.rs` | CLI 参数及批量转换 |
 | `src/lib.rs` | 解析、资源构建、网格量化及 VAB 写入 |
 | `src/animation.rs` / `src/baked.rs` | 编译期时间轴、最终烘焙树与校验 |

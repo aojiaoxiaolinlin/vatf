@@ -5,7 +5,31 @@ use serde::{Deserialize, Serialize};
 use std::{io::Cursor, path::Path};
 
 /// Increment when compiler behavior changes, independently of the VAB layout version.
-pub const COMPILER_REVISION: u32 = 2;
+pub const COMPILER_REVISION: u32 = 3;
+
+/// Chunk-level lossless compression applied to high-redundancy VAB chunks
+/// (`VERT`, `INDX`, `IND2`, `BAKD`, `UIGR`, etc.). Already-compressed `TEXT`
+/// payloads are never re-compressed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VabCompression {
+    /// Store all chunks uncompressed.
+    None,
+    /// Ultra-fast LZ4 block compression (GB/s decompression).
+    Lz4,
+    /// Deflate compression (smaller distribution size, pure Rust).
+    #[default]
+    Deflate,
+}
+
+impl VabCompression {
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::None => crate::compression::NONE,
+            Self::Lz4 => crate::compression::LZ4,
+            Self::Deflate => crate::compression::DEFLATE,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwfCompileMode {
@@ -36,6 +60,9 @@ pub struct SwfCompileSettings {
     /// Defaults to Preserve when omitted from existing processor metadata.
     #[serde(default)]
     pub root_translation: RootTranslationPolicy,
+    /// Defaults to Deflate when omitted from existing processor metadata.
+    #[serde(default)]
+    pub compression: VabCompression,
 }
 
 pub struct CompiledVab {
@@ -46,7 +73,7 @@ pub struct CompiledVab {
 /// Compile directly from source bytes, without temporary files or runtime assets.
 pub fn compile_swf(bytes: &[u8], settings: &SwfCompileSettings) -> Result<CompiledVab> {
     let builder = build_builder_reader(Cursor::new(bytes), settings)?;
-    let (bytes, pruning) = builder.to_vab_bytes()?;
+    let (bytes, pruning) = builder.to_vab_bytes_with_compression(settings.compression)?;
     Ok(CompiledVab { bytes, pruning })
 }
 

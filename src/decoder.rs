@@ -47,7 +47,9 @@ impl Bitmap {
             BitmapFormat::Rgb => {
                 self.data = self
                     .data
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
                     .collect();
             }
@@ -75,7 +77,9 @@ impl Bitmap {
 
                 // RGB components need to be clamped to alpha to avoid invalid premultiplied colors
                 self.data = rgba
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .zip(a)
                     .flat_map(|(rgba, a)| [rgba[0].min(*a), rgba[1].min(*a), rgba[2].min(*a), *a])
                     .collect()
@@ -192,7 +196,9 @@ fn decode_jpeg(jpeg_data: &[u8], alpha_data: Option<&[u8]>) -> Result<Bitmap, Er
     let decoded_data = match metadata.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => decoded_data,
         jpeg_decoder::PixelFormat::CMYK32 => decoded_data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|cmyk| {
                 let c = 255 - u16::from(cmyk[0]);
                 let m = 255 - u16::from(cmyk[1]);
@@ -218,7 +224,9 @@ fn decode_jpeg(jpeg_data: &[u8], alpha_data: Option<&[u8]>) -> Result<Bitmap, Er
 
         if alpha_data.len() == decoded_data.len() / 3 {
             let rgba = decoded_data
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .zip(alpha_data)
                 .flat_map(|(rgb, a)| {
                     // The JPEG data should be premultiplied alpha, but it isn't in some incorrect
@@ -280,19 +288,19 @@ fn decode_png(data: &[u8]) -> Result<Bitmap, Error> {
             BitmapFormat::Rgb,
             data.into_iter().flat_map(|v| [v, v, v]).collect(),
         ),
-        ColorType::GrayscaleAlpha => {
-            (
-                BitmapFormat::Rgba,
-                data.chunks_exact(2)
-                    .flat_map(|pixel| {
-                        // Pre-multiply alpha.
-                        let a = pixel[1];
-                        let v = (u16::from(pixel[0]) * u16::from(a) / 255) as u8;
-                        [v, v, v, a]
-                    })
-                    .collect(),
-            )
-        }
+        ColorType::GrayscaleAlpha => (
+            BitmapFormat::Rgba,
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|pixel| {
+                    // Pre-multiply alpha.
+                    let a = pixel[1];
+                    let v = (u16::from(pixel[0]) * u16::from(a) / 255) as u8;
+                    [v, v, v, a]
+                })
+                .collect(),
+        ),
         ColorType::Indexed => {
             // Shouldn't get here because of `normalize_to_color8` transformation above.
             unreachable!("Unexpected PNG ColorType::Indexed");
@@ -335,7 +343,7 @@ fn decode_gif(data: &[u8]) -> Result<Bitmap, Error> {
 
 /// Converts standard RBGA to premultiplied alpha.
 fn premultiply_alpha_rgba(rgba: &mut [u8]) {
-    rgba.chunks_exact_mut(4).for_each(|rgba| {
+    rgba.as_chunks_mut::<4>().0.iter_mut().for_each(|rgba| {
         let a = f32::from(rgba[3]) / 255.0;
         rgba[0] = (f32::from(rgba[0]) * a) as u8;
         rgba[1] = (f32::from(rgba[1]) * a) as u8;
@@ -534,7 +542,7 @@ pub fn decode_define_bits_lossless(swf_tag: &swf::DefineBitsLossless) -> Result<
             out_data
         }
         (1 | 2, swf::BitmapFormat::Rgb32) => {
-            for rgba in decoded_data.chunks_exact_mut(4) {
+            for rgba in decoded_data.as_chunks_mut::<4>().0 {
                 rgba.rotate_left(1);
                 if !has_alpha {
                     rgba[3] = u8::MAX;

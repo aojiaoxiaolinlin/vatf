@@ -1,12 +1,12 @@
 # 01 · `.vab` 二进制格式规范
 
-> 本篇保留源码分析摘录和历史行号；当前编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
+> 本篇保留源码分析摘录，当前已更新至 VAB v2 格式契约；编译模式、UI、裁剪与预处理契约见 [08](08-ui-and-compilation.md)。源码行号可能随重构变化。
 
-文件格式常量定义在 `src/lib.rs:45-60`，读取实现在 `src/reader.rs`。
+文件格式常量定义在 `src/lib.rs`，读取实现在 `src/reader.rs`。
 
 ```rust
 pub const MAGIC_BYTES: &[u8; 4] = b"VATF";
-pub const VAB_VERSION: u32 = 1;
+pub const VAB_VERSION: u32 = 2;
 ```
 
 > 注意命名不一致：magic 是 `VATF`，crate 名是 `vatf`，而文件扩展名和文档里到处叫 `.vab`。三者指同一个东西。
@@ -57,34 +57,39 @@ if header.length as usize != bytes.len() {
 ## 2. Chunk 布局
 
 ```
-┌──────────────────────────┐
-│  chunk_type : [u8;4]     │  FourCC
-│  length     : u32        │  payload 字节数（不含这 8 字节头）
-├──────────────────────────┤
-│  payload  … (length B)   │
-└──────────────────────────┘
+┌──────────────────────────────────┐
+│  chunk_type          : [u8;4]    │  FourCC
+│  length              : u32       │  文件中存储字节数（压缩后，不含这 16 字节头）
+│  uncompressed_length : u32       │  解压后字节数（compression == NONE 时等于 length）
+│  compression         : u8        │  0=NONE, 1=LZ4, 2=DEFLATE
+│  _reserved           : [u8;3]    │  必须为 [0, 0, 0]
+├──────────────────────────────────┤
+│  payload  … (length B)           │
+└──────────────────────────────────┘
 紧接着就是下一个 chunk 的 FourCC —— 没有填充字节
 ```
 
-`CHUNK_HEADER_SIZE = size_of::<ChunkHeader>() = 8`（`src/lib.rs:60`）。
+`CHUNK_HEADER_SIZE = size_of::<ChunkHeader>() = 16`。写端默认使用 `Deflate` 无损压缩块载荷（支持通过 `VabCompression` 选择 `None` / `Lz4` / `Deflate`）；`TEXT` 内部已是 WebP 图像，写入时跳过再压缩，其他块若压缩后未缩小体积则自动回退 `NONE`。
 
-**写入顺序固定**（`src/lib.rs:505-516`），但读取端用 `HashMap<[u8;4], AlignedChunk>` 存储，**顺序无关**：
+**写入顺序固定**，但读取端按块解压到 `AlignedChunk` 后用 `HashMap<[u8;4], AlignedChunk>` 存储，**顺序无关**：
 
 | # | FourCC | 内容 | 编码 | 说明 |
 |---|---|---|---|---|
-| 0 | `BAKD` | `BakedMovie` | bincode | **必需**；运行时的绘制树 + 帧率 |
+| 0 | `BAKD` | `BakedMovie` | compact binary | **必需**；运行时的绘制树 + 帧率 |
 | 1 | `SHAP` | `[ShapeRecord]` | POD | shape id → 网格区间查找表 |
 | 2 | `SHME` | `[ShapeMesh]` | POD | 每个 draw call 的几何元数据 |
 | 3 | `GRAD` | `[GradientUniforms]` | POD | 渐变着色器 uniform |
 | 4 | `BMAP` | `[[f32;6]]` | POD | 位图纹理变换 |
-| 5 | `TEXT` | 原始字节 | 无 | 交错的 WebP 纹理池 |
-| 6 | `VERT` | `[Vertex]` | POD | 量化顶点 |
-| 7 | `INDX` | `[u32]` | POD | 三角形索引 |
-| 8 | `MORP` | `[MorphEntry]` | POD | morph 预插值网格表 |
+| 5 | `TEXD` | `[TextureRecord]` | POD | 显式纹理记录（偏移、长度、宽高、编码） |
+| 6 | `TEXT` | 原始字节 | 无（跳过块压缩） | 去重拼接的 WebP / RGBA8 纹理字节池 |
+| 7 | `VERT` | `[Vertex]` | POD | 量化顶点 |
+| 8 | `INDX` | `[u32]` | POD | 32 位三角形索引（顶点数 > 65535 时使用） |
+| 9 | `IND2` | `[u16]` | POD | 16 位三角形索引（顶点数 ≤ 65535 时优先使用） |
+| 10 | `MORP` | `[MorphEntry]` | POD | morph 预插值网格表 |
 
-基础写端**总是写出上述 9 个 chunk**，即使内容为空——`round_trip_empty_file`（`src/reader.rs`）断言了这一点，并额外断言 `ANIM` **不**存在。
+基础写端**总是写出上述 11 个 chunk**，即使内容为空——`round_trip_empty_file`（`src/reader.rs`）断言了这一点，并额外断言 `ANIM` **不**存在。
 
-UI 文件还可写入 bincode 编码的 `UIGR`（命名图形与全部帧）和 `UIBT`（原生按钮状态引用）。普通动画不需要这些 UI chunk；具体读取契约见 [08](08-ui-and-compilation.md)。
+UI 文件还可写入紧凑二进制编码的 `UIGR`（命名图形与全部帧）和 bincode 编码的 `UIBT`（原生按钮状态引用）。普通动画不需要这些 UI chunk；具体读取契约见 [08](08-ui-and-compilation.md)。
 
 > **历史注记**：早期版本有第 10 个 chunk `ANIM`（`AnimContainer`，未展开的 per-sprite 显示列表），与 `BAKD` 并存。它占动画密集型产物 **17%–54%** 的体积，而唯一只有它才有的数据是 `frame_rate` —— 一个 f32。已删除，帧率移入 `BakedMovie::frame_rate`（[07 篇 §8](07-design-notes.md)）。
 
@@ -108,15 +113,29 @@ if chunks.contains_key(&chunk_header.chunk_type) {
 
 | 偏移 | 类型 | 字段 | 说明 |
 |---|---|---|---|
-| 0 | `u32` | `version` | 必须等于 `3` |
+| 0 | `u32` | `version` | 必须等于 `VAB_VERSION`（当前 `2`） |
 | 4 | `u32` | `length` | 整个文件长度 |
 
-### `ChunkHeader` — 8 B
+### `ChunkHeader` — 16 B
 
-| 偏移 | 类型 | 字段 |
-|---|---|---|
-| 0 | `[u8;4]` | `chunk_type` |
-| 4 | `u32` | `length` |
+| 偏移 | 类型 | 字段 | 说明 |
+|---|---|---|---|
+| 0 | `[u8;4]` | `chunk_type` | FourCC |
+| 4 | `u32` | `length` | 存储的压缩字节数 |
+| 8 | `u32` | `uncompressed_length` | 解压后字节数 |
+| 12 | `u8` | `compression` | `0=NONE`, `1=LZ4`, `2=DEFLATE` |
+| 13 | `[u8;3]` | `_reserved` | 必须全 0 |
+
+### `TextureRecord` — 16 B
+
+| 偏移 | 类型 | 字段 | 说明 |
+|---|---|---|---|
+| 0 | `u32` | `offset` | 在 `TEXT` 中的字节偏移 |
+| 4 | `u32` | `length` | 纹理字节长度 |
+| 8 | `u16` | `width` | 纹理宽度（像素） |
+| 10 | `u16` | `height` | 纹理高度（像素） |
+| 12 | `u8` | `encoding` | `0=WEBP`, `1=RAW_RGBA8` |
+| 13 | `[u8;3]` | `_pad` | 显式对齐填充 |
 
 ### `Color` — 4 B
 
@@ -152,11 +171,12 @@ if chunks.contains_key(&chunk_header.chunk_type) {
 | 0 | `u32` | `vertex_count` | |
 | 4 | `u32` | `vertex_offset` | 在 `VERT` 中的起始下标 |
 | 8 | `u32` | `index_count` | 是 3 的倍数 |
-| 12 | `u32` | `index_offset` | 在 `INDX` 中的起始下标 |
+| 12 | `u32` | `index_offset` | 在 `INDX` 或 `IND2` 中的起始下标 |
 | 16 | `u16` | `material_type` | `0=COLOR` `1=GRADIENT` `2=BITMAP` |
 | 18 | `u16` | `sampler_flags` | bit0 = smoothed，bit1 = repeating |
-| 20 | `u32` | `texture_offset` | 在 `TEXT` 中的字节偏移 |
-| 24 | `u32` | `texture_length` | 字节长度 |
+| 20 | `u32` | `texture_index` | 在 `TEXD` 中的下标；纯色网格为 `NO_TEXTURE` (`u32::MAX`) |
+| 24 | `u16` | `index_format` | `0=U32`（`INDX`）、`1=U16`（`IND2`） |
+| 26 | `u16` | `_pad` | 显式对齐填充 |
 | 28 | `u32` | `material_offset` | 在 `GRAD`（渐变）或 `BMAP`（位图）中的下标 |
 | 32 | `f32` | `bounds_half_x` | 反量化参数，见 §4 |
 | 36 | `f32` | `bounds_half_y` | |
@@ -263,9 +283,9 @@ pub mod material {
 
 | `material_type` | 取 uniform | 取纹理 |
 |---|---|---|
-| `COLOR` | 无 | 无（直接用 `Vertex.color`） |
-| `GRADIENT` | `GRAD[material_offset]` | `TEXT[texture_offset..+texture_length]`（256×1 WebP 斜坡） |
-| `BITMAP` | `BMAP[material_offset]`（`[f32;6]`） | `TEXT[texture_offset..+texture_length]`（WebP 位图） |
+| `COLOR` | 无 | 无（直接用 `Vertex.color`，`texture_index == NO_TEXTURE`） |
+| `GRADIENT` | `GRAD[material_offset]` | 通过 `TEXD[texture_index]` 取 `TEXT[offset..+length]`（256×1 WebP 斜坡） |
+| `BITMAP` | `BMAP[material_offset]`（`[f32;6]`） | 通过 `TEXD[texture_index]` 取 `TEXT[offset..+length]`（WebP/RGBA8 位图） |
 
 ### `sampler_flags` 位域
 
@@ -278,21 +298,15 @@ sampler_flags: u16::from(bm.is_smoothed) | (u16::from(bm.is_repeating) << 1)
 | 0 | `is_smoothed`（线性过滤） |
 | 1 | `is_repeating`（`Repeat` 寻址；否则 `Clamp`） |
 
-### TEXT 是交错池，不是一个纹理
+### `TEXD` 与 `TEXT`：去重纹理表与字节池
 
-`TEXT` 里按顺序塞着所有纹理的字节，**渐变斜坡和位图混在一起**，靠 `ShapeMesh` 的 `texture_offset` / `texture_length` 切片。写端按**字节内容**去重（`VatfBuilder::intern_texture`，`src/lib.rs:293-301`）：
+`TEXT` 里按顺序拼接所有纹理字节，**渐变斜坡和位图混在一起**，并通过 `TEXD`（`[TextureRecord]`）统一索引，使运行时能对每个纹理记录只解码一次（即使多个 draw 使用不同采样模式或渐变着色）。写端在 `VatfBuilder::intern_texture` 中按 `(bytes, width, height, encoding)` 四元组去重，返回 `TEXD` 下标：
 
 ```rust
-fn intern_texture(&mut self, bytes: &[u8]) -> (u32, u32) {
-    if let Some(entry) = self.texture_lookup.get(bytes) { return *entry; }
-    let entry = (self.texture.len() as u32, bytes.len() as u32);
-    self.texture.extend_from_slice(bytes);
-    self.texture_lookup.insert(bytes.to_vec(), entry);
-    entry
-}
+pub fn intern_texture(&mut self, bytes: &[u8], width: u16, height: u16, encoding: u8) -> u32
 ```
 
-所以两个 shape 用同一个位图、或两个 draw 用同一条渐变斜坡，只会在 `TEXT` 里存一份。
+所以两个 shape 用同一个位图、或两个 draw 用同一条渐变斜坡，只在 `TEXD` 和 `TEXT` 里存一份。
 
 ### 纹理统一是 WebP
 
@@ -333,38 +347,20 @@ for mi in mesh_start..builder.shape_meshes.len() as u32 {
 
 ---
 
-## 7. BAKD 的编码细节
+## 7. `BAKD` / `UIGR` 的编码细节
 
-`BAKD` **不是 POD**，是 `bincode` 序列化。
+VAB v2 中，`BAKD`（以及 `UIGR`）不再使用 `bincode`，而是采用 `src/compact.rs` 实现的无损紧凑二进制编解码器（仅可选 `UIBT` 按钮索引块仍使用 `bincode` fixint + `with_limit` + `reject_trailing_bytes`）：
 
-### 必须是 fixint 编码
-
-写端用的是 `bincode::serialize`（`src/lib.rs`），读端显式指定（`src/reader.rs:133-138`）：
-
-```rust
-bincode::DefaultOptions::new()
-    .with_fixint_encoding()
-    .with_limit(bytes.len() as u64)
-    .reject_trailing_bytes()
-    .deserialize::<BakedMovie>(baked_data.as_bytes())
-```
-
-> ⚠️ **这是一处隐蔽的耦合。** `bincode 1.3` 里 `DefaultOptions::new()` 默认是 **varint**，而顶层函数 `bincode::serialize` 明确强制了 **fixint**（`bincode-1.3.3/src/lib.rs`：`DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().serialize(value)`）。两端因此才碰巧对得上。
->
-> 如果谁把写端改成 `DefaultOptions::new().serialize(...)`，读端会**静默解析出错误结果**（不一定报错）。改这边必须两边一起改。
-
-读端在两处比写端更严格：
-
-- `with_limit(bytes.len() as u64)` —— 反序列化炸弹防护。恶意长度前缀最多只能要求分配**整个文件大小**的内存量。注意限额用的是**文件总长**而不是该 chunk 的长度，所以粒度偏松（见 07 篇）。
-- `reject_trailing_bytes()` —— chunk 必须**恰好**解码完，多一字节都算损坏。
+- **帧级去重（Frame Interning）**：对重复出现的烘焙帧只编码一次并存入帧表，动作帧和 UI 帧仅存 LEB128 varint 索引。
+- **位掩码省略默认变换**：每个节点的 5 位载荷掩码按需写入旋转/缩放线性矩阵（省略单位矩阵）、平移（省略 `(0, 0)`）和颜色乘加（省略单位颜色变换），大幅压缩大量静态或纯平移节点体积。
+- **精确无损与防呆边界**：所有 `f32` 按位精确往返（`to_bits` / `from_bits`），节点树强制 `MAX_NESTING_DEPTH = 128` 深度上限，末尾检查无多余尾随字节（`cur.finish()?`）。
 
 ### BAKD 是必需的，且读取时校验
 
 ```rust
 // src/reader.rs
 let baked_data = chunks.get(b"BAKD").context("VAB missing BAKD chunk")?;
-let baked = bincode::DefaultOptions::new()…deserialize(baked_data.as_bytes())
-    .context("Corrupt BAKD chunk")?;
+let baked = crate::compact::decode_movie(baked_data.as_bytes()).context("Corrupt BAKD chunk")?;
 baked.validate()?;
 ```
 
@@ -388,21 +384,20 @@ pub struct BakedMovie {
 
 | 机制 | 位置 | 行为 |
 |---|---|---|
-| magic 校验 | `src/reader.rs:77-79` | 不等于 `b"VATF"` 直接 bail |
-| 版本校验 | `src/reader.rs:82-87` | 必须**精确等于** `VAB_VERSION`（当前 `1`） |
-| 长度校验 | `src/reader.rs:88-94` | `header.length` 必须等于实际文件长度 |
-| 大端守卫 | `src/reader.rs:70-72`、`src/lib.rs:479-481` | 大端主机直接拒绝 |
-| 重复 chunk | `src/reader.rs:122-124` | 报错 |
-| 截断保护 | `src/reader.rs:110-120` | `checked_add` 防 `u32` 溢出，越界报错 |
-| 长度乘积校验 | `src/reader.rs:197-202` | 见下 |
+| magic 校验 | `src/reader.rs` | 不等于 `b"VATF"` 直接 bail |
+| 版本校验 | `src/reader.rs` | 必须**精确等于** `VAB_VERSION`（当前 `2`） |
+| 长度校验 | `src/reader.rs` | `header.length` 必须等于实际文件长度 |
+| 大端守卫 | `src/reader.rs`、`src/lib.rs` | 大端主机直接拒绝 |
+| 重复 chunk | `src/reader.rs` | 报错 |
+| 截断保护 | `src/reader.rs` | `checked_add` 防 `u32` 溢出，越界报错 |
+| 解压炸弹与保留字段校验 | `src/reader.rs` | `_reserved == [0; 3]`，`uncompressed_length <= 256 MiB`，校验实际解压长度及尾随字节 |
+| 长度乘积校验 | `src/reader.rs` | 见下 |
 
 ### 版本策略：格式与编译行为分别管理
 
-读取端要求版本精确等于 `VAB_VERSION`，不提供旧版本迁移。当前格式版本为 **1**，与 crate 版本独立；发布后的不兼容 schema 或 POD 布局变更必须提高 `VAB_VERSION`，并从源 SWF 重新生成 VAB。
+读取端要求版本精确等于 `VAB_VERSION`，不提供旧版本迁移。当前格式版本为 **2**，与 crate 版本独立；任何不兼容的 schema、压缩或 POD 布局变更必须提高 `VAB_VERSION`，并从源 SWF 重新生成 VAB（v1 产物不再兼容 v2 读取端）。
 
-首次发布前的开发产物可能在相同版本号下使用不同 schema：头部版本和长度通过不代表当前读取端能够正确读取。建议重新转换这些产物；发布后通过递增格式版本识别不兼容的布局变化。
-
-`COMPILER_REVISION` 是独立的编译器行为修订号：转换结果语义变化时递增，即使格式布局不变。配套 Bevy 插件用该修订号隔离预处理缓存；源文件和设置没变时，缓存仍须随编译器变化失效。测试与读取基准从源 SWF 生成当前产物，不依赖预生成的 VAB。
+`COMPILER_REVISION`（当前为 **3**）是独立的编译器行为修订号：转换结果语义或优化布局变化时递增，即使文件容器兼容。配套 Bevy 插件用该修订号隔离预处理缓存；源文件和设置没变时，缓存仍须随编译器变化失效。测试与读取基准从源 SWF 生成当前产物，不依赖预生成的 VAB。
 
 ### POD 元素的隐式长度校验
 

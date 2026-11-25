@@ -10,16 +10,20 @@
 
 ```toml
 [dependencies]
-vatf = "0.1.0"
+vatf = "0.2.0"
 ```
 
 安装命令行工具并转换自己的 SWF：
 
 ```sh
-cargo install vatf --version 0.1.0 --locked
+cargo install vatf --version 0.2.0 --locked
 
-# 普通动画
+# 普通动画（默认启用 deflate 无损块压缩）
 vatf animation.swf -o animation.vab
+
+# 使用极速解压的 lz4 或关闭块压缩
+vatf animation.swf --compression lz4 -o animation.vab
+vatf animation.swf --compression none -o animation.vab
 
 # 静态矢量 UI
 vatf ui.swf --ui -o ui.vab
@@ -53,7 +57,7 @@ cargo run --release -- fixtures/background551284.swf --ui-animated -o target/exa
 cargo run --release -- fixtures/login.swf --ui -o target/examples/login.vab
 ```
 
-`-o` 在单文件模式下是完整输出文件名；省略时输出到源文件旁的同名 `.vab`。输入目录时，转换其第一层 `.swf` 文件，默认输出到该目录下的 `output/`。不递归，也不会自动判断每个文件应使用哪种模式；不同类型的 UI 与动画应分开转换。
+`-o` 在单文件模式下是完整输出文件名；省略时输出到源文件旁的同名 `.vab`。输入目录时，转换其第一层 `.swf` 文件，默认输出到该目录下的 `output/`。不递归，也不会自动判断每个文件应使用哪种模式；不同类型的 UI 与动画应分开转换。`--compression` 支持 `deflate`（默认）、`lz4` 与 `none`，对应库 API 中的 `SwfCompileSettings::compression`（`VabCompression`）；跳过已压缩的 `TEXT`（WebP）块，压缩无收益时自动保留原始存储。
 
 ## 选择编译模式
 
@@ -110,11 +114,11 @@ fn main() -> anyhow::Result<()> {
 
 ## 资源裁剪与资产预处理
 
-UI 在三角化前只选择 ExportAssets 及其依赖。写 VAB 前，所有模式再次从最终烘焙引用裁剪资源，重新排列网格、顶点、索引、材质和纹理偏移。所有动作帧、所有皮肤变体、遮罩和 UI 状态都是保留根，不根据当前显示状态裁剪。报告中的资源字节数不等于整个 VAB 文件大小。
+UI 在三角化前只选择 ExportAssets 及其依赖；普通动画也会在三角化前按根时间轴可达性跳过完全未放置的 `DefineShape`。写 VAB 前，所有模式再次从最终烘焙引用裁剪资源，重新排列网格、顶点、索引（顶点数不超过 `65535` 时自动写入 `u16` 索引表 `IND2`）、材质和纹理偏移（`TEXD` 显式纹理记录）。所有动作帧、所有皮肤变体、遮罩和 UI 状态都是保留根，不根据当前显示状态裁剪。报告中的资源字节数不等于整个 VAB 文件大小。
 
-Bevy 的 `VabAssetProcessorPlugin` 直接调用 `compile_swf`，不启动 CLI，也不依赖临时文件。元数据使用同一个 `SwfCompileSettings` 选择编译模式；处理后的 `.swf` 路径保存 VAB 字节及加载器元数据，`.swf#export` 仍可加载。开发时启用处理器，发布时分发处理产物并关闭处理器。完整接入代码见配套 `bevy_flash_remake` 项目的 README；该渲染器单独维护，不包含在 vatf 发布包中。
+Bevy 的 `VabAssetProcessorPlugin` 直接调用 `compile_swf`，不启动 CLI，也不依赖临时文件。元数据使用同一个 `SwfCompileSettings` 选择编译模式、根平移策略与块压缩方式；处理后的 `.swf` 路径保存 VAB 字节及加载器元数据，`.swf#export` 仍可加载。开发时启用处理器，发布时分发处理产物并关闭处理器。完整接入代码见配套 [`bevy_flash`](https://github.com/aojiaoxiaolinlin/bevy_flash) 项目的 README；该渲染器单独维护，不包含在 vatf 发布包中。
 
-**当前 VAB 格式版本为 1，与 crate 版本独立。** 读取端要求格式版本精确匹配，不提供旧版本迁移；不兼容的布局改动需要提高格式版本，并从源 SWF 重新生成 VAB。首次发布前的开发产物可能使用不同布局，建议重新转换。`COMPILER_REVISION` 是独立的编译器行为修订号，编译结果语义变化时递增，配套插件用它隔离预处理缓存。详见 [版本策略](https://github.com/aojiaoxiaolinlin/vatf/blob/HEAD/docs/01-format.md#8-版本与兼容性)。
+**当前 VAB 格式版本为 2（`VAB_VERSION = 2`），与 crate 版本独立。** VAB v2 引入 16 字节带压缩信息的块头、`TEXD` 纹理表、`IND2` 16 位索引及无损紧凑二进制 `BAKD`/`UIGR` 编码，零矢量精度损失。读取端要求格式版本精确匹配，不提供旧版本迁移；不再兼容 v1 产物，升级后需从源 SWF 重新转换。`COMPILER_REVISION` 是独立的编译器行为修订号（当前为 `3`），编译结果语义或输出变化时递增，配套插件用它隔离预处理缓存。详见 [版本策略](https://github.com/aojiaoxiaolinlin/vatf/blob/HEAD/docs/01-format.md#8-版本与兼容性)。
 
 ## 验证与性能测试
 
@@ -137,11 +141,11 @@ cargo bench --bench bench_read
 
 仓库包含 `.github/workflows/release.yml`。推送与 `Cargo.toml` 版本一致的 `v` 标签后，GitHub Actions 会先运行测试，再构建 Windows x64、Linux x64 和 macOS ARM64 的 CLI 发布包，附带 README、许可证和 SHA-256 校验文件，并创建 GitHub Release。Linux 产物在 Ubuntu 24.04 上构建，需要兼容的 glibc 环境；macOS 产物面向 Apple Silicon。
 
-先提交并推送工作流和版本变更，再推送标签。例如当前版本为 `0.1.0` 时：
+先提交并推送工作流和版本变更，再推送标签。例如当前版本为 `0.2.0` 时：
 
 ```sh
-git tag -a v0.1.0 -m "Release vatf 0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "Release vatf 0.2.0"
+git push origin v0.2.0
 ```
 
 标签版本不匹配时工作流会失败。带有 `-` 后缀的版本（例如 `v0.2.0-rc.1`）会标记为预发布。也可以在 GitHub 的 Actions 页面手动运行 **Build release**，只构建可下载的产物，不创建 Release。工作流使用 GitHub 自动提供的令牌，无需配置额外 Secret；crates.io 发布仍通过 `cargo publish` 单独执行。
@@ -165,7 +169,7 @@ git push origin v0.1.0
 ## 文档与效果展示
 
 - [技术文档目录](https://github.com/aojiaoxiaolinlin/vatf/blob/HEAD/docs/README.md)：格式、解析、三角化、烘焙、读取端及 UI 编译接口。
-- 配套 `bevy_flash_remake` 项目：提供 Bevy 渲染器，具体接入方式见该项目文档。
+- 配套 [`bevy_flash`](https://github.com/aojiaoxiaolinlin/bevy_flash) 项目：提供 Bevy 渲染器，具体接入方式见该项目文档。
 - [素材说明](https://github.com/aojiaoxiaolinlin/vatf/blob/HEAD/fixtures/README.md)：用途、来源与导出名。
 
 这是视觉动画转换器，不是完整 Flash 虚拟机。ActionScript、交互行为、声音及动态文本运行时不在此项目范围内；混合和滤镜的最终支持程度取决于使用 VAB 的渲染器。测试素材仅用于开发验证，包含素材不代表提供原作品的授权。
